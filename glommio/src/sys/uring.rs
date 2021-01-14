@@ -401,7 +401,7 @@ where
             }
         }
     }
-
+    println!("User data: {}", user_data);
     sqe.set_user_data(user_data);
 }
 
@@ -988,7 +988,7 @@ macro_rules! flush_rings {
     }}
 }
 
-fn align_up(v: usize, align: usize) -> usize {
+const fn align_up(v: usize, align: usize) -> usize {
     (v + align - 1) & !(align - 1)
 }
 
@@ -1137,6 +1137,12 @@ impl Reactor {
             }
             _ => unreachable!(),
         }
+    }
+
+    pub(crate) fn poll(&self, source: &Source, options: PollFlags) {
+        println!("reactor poll: {:?}, flags: {:?}", source, options);
+        let op = UringOpDescriptor::PollAdd(options);
+        self.queue_standard_request(source, op);
     }
 
     pub(crate) fn recv(&self, source: &Source, len: usize, flags: MsgFlags) {

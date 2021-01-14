@@ -257,6 +257,7 @@ pub(crate) enum SourceType {
     Timeout(TimeSpec64),
     Connect(SockAddr),
     Accept(SockAddrStorage),
+    Poll,
     Invalid,
 }
 

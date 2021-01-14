@@ -23,7 +23,7 @@
 //!
 
 use ahash::AHashMap;
-use iou::{SockAddr, SockAddrStorage};
+use iou::{PollFlags, SockAddr, SockAddrStorage};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
@@ -375,6 +375,13 @@ impl Reactor {
         Ok(source)
     }
 
+    pub(crate) fn poll(&self, fd: RawFd, flags: PollFlags) -> Source {
+        println!("Entering rushed poll..");
+        let source = self.new_source(fd, SourceType::Poll);
+        self.sys.poll(&source, flags);
+        source
+    }
+
     pub(crate) fn rushed_recvmsg(
         &self,
         fd: RawFd,
@@ -611,10 +618,12 @@ impl Source {
     pub(crate) async fn collect_rw(&self) -> io::Result<usize> {
         future::poll_fn(|cx| {
             if let Some(result) = self.take_result() {
+                println!("Waking async task..");
                 return Poll::Ready(result);
             }
 
             self.add_waiter(cx.waker().clone());
+            println!("Adding waker and returning pending..");
             Poll::Pending
         })
         .await

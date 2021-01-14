@@ -3,11 +3,11 @@
 //
 // This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //
-use std::path::PathBuf;
 use std::{
     fmt::{self, Debug},
     io,
 };
+use std::{num::TryFromIntError, path::PathBuf};
 use std::{os::unix::io::RawFd, path::Path};
 use thiserror::Error;
 
@@ -51,13 +51,19 @@ pub enum QueueErrorKind {
 /// Errors coming from the reactor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReactorErrorKind {
+    /// Incorrect source type
     IncorrectSourceType,
+
+    /// Reactor dropped/not found. This can happen if you attempt to upgrade the reference-counted reactor
+    /// and it isn't still there.
+    ReactorNotFound,
 }
 
 impl fmt::Display for ReactorErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ReactorErrorKind::IncorrectSourceType => write!(f, "Incorrect source type!"),
+            ReactorErrorKind::ReactorNotFound => write!(f, "Reactor dropped/not found"),
         }
     }
 }
@@ -154,6 +160,10 @@ pub enum GlommioError<T> {
     /// of the io-uring instances or related.
     #[error("Reactor error: {0}")]
     ReactorError(ReactorErrorKind),
+
+    /// Error casting integers from different sizes.
+    #[error("Failed to cast integer: {0}")]
+    InvalidIntegerCast(#[from] TryFromIntError),
 }
 
 impl GlommioError<()> {
@@ -261,8 +271,12 @@ impl<T> Debug for GlommioError<T> {
             GlommioError::ReactorError(kind) => {
                 let kind = match kind {
                     ReactorErrorKind::IncorrectSourceType => "IncorrectSourceType",
+                    ReactorErrorKind::ReactorNotFound => "ReactorNotFound",
                 };
                 write!(f, "ReactorError {{ kind: '{}' }}", kind)
+            }
+            GlommioError::InvalidIntegerCast(inner) => {
+                write!(f, "InvalidIntegerCase {{ inner: '{}' }}", inner)
             }
         }
     }
@@ -298,6 +312,7 @@ impl<T> From<GlommioError<T>> for io::Error {
             GlommioError::ReactorError(_) => {
                 io::Error::new(io::ErrorKind::InvalidData, "Incorrect source type!")
             }
+            GlommioError::InvalidIntegerCast(inner) => io::Error::new(io::ErrorKind::Other, inner),
         }
     }
 }
