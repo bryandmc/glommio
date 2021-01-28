@@ -8,7 +8,7 @@ edition = "2018"
 futures = "0.3.5"
 futures-lite = "1.11.1"
 ansi_term = "0.12.1"
-glommio = { version = "0.3.0", path = "../glommio" }
+glommio = { version = "0.3.0", path = "../glommio", features = ["xdp"] }
 pretty-bytes = "0.2.2"
 clap = "2.33"
 sys-info = "0.7.0"
@@ -41,3 +41,7 @@ path = "deadline_writer.rs"
 [[example]]
 name = "storage"
 path = "storage.rs"
+
+[[example]]
+name = "af_xdp"
+path = "af_xdp.rs"

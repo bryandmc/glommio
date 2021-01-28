@@ -49,6 +49,8 @@ use crate::multitask;
 use crate::parking;
 use crate::task::{self, waker_fn::waker_fn};
 use crate::GlommioError;
+#[cfg(feature = "xdp")]
+use crate::{net::xdp::XdpConfig, sys::ebpf};
 use crate::{IoRequirements, Latency};
 use crate::{Reactor, Shares};
 use ahash::AHashMap;
@@ -368,6 +370,9 @@ pub struct LocalExecutorBuilder {
     /// with io_uring. It is still possible to use more than that but it will come from the
     /// standard allocator and performance will suffer. Defaults to 10MB.
     io_memory: usize,
+
+    #[cfg(feature = "xdp")]
+    xdp_config: Option<XdpConfig>,
 }
 
 impl LocalExecutorBuilder {
@@ -379,6 +384,8 @@ impl LocalExecutorBuilder {
             spin_before_park: None,
             name: String::from("unnamed"),
             io_memory: 10 << 20,
+            #[cfg(feature = "xdp")]
+            xdp_config: None,
         }
     }
 
@@ -412,6 +419,13 @@ impl LocalExecutorBuilder {
         self
     }
 
+    /// Xdp configuration.
+    #[cfg(feature = "xdp")]
+    pub fn xdp_config(mut self, config: XdpConfig) -> LocalExecutorBuilder {
+        self.xdp_config = Some(config);
+        self
+    }
+
     /// Make a new [`LocalExecutor`] by taking ownership of the Builder, and returns a
     /// [`Result`](crate::Result) to the executor.
     /// # Examples
@@ -422,6 +436,13 @@ impl LocalExecutorBuilder {
     /// let local_ex = LocalExecutorBuilder::new().make().unwrap();
     /// ```
     pub fn make(self) -> Result<LocalExecutor> {
+        #[cfg(feature = "xdp")]
+        let mut le = LocalExecutor::new(
+            EXECUTOR_ID.fetch_add(1, Ordering::Relaxed),
+            self.io_memory,
+            self.xdp_config.unwrap(),
+        );
+        #[cfg(not(feature = "xdp"))]
         let mut le =
             LocalExecutor::new(EXECUTOR_ID.fetch_add(1, Ordering::Relaxed), self.io_memory);
         if let Some(cpu) = self.binding {
@@ -482,6 +503,9 @@ impl LocalExecutorBuilder {
         Builder::new()
             .name(name)
             .spawn(move || {
+                #[cfg(feature = "xdp")]
+                let mut le = LocalExecutor::new(id, self.io_memory, self.xdp_config.unwrap());
+                #[cfg(not(feature = "xdp"))]
                 let mut le = LocalExecutor::new(id, self.io_memory);
                 if let Some(cpu) = self.binding {
                     le.bind_to_cpu(cpu).unwrap();
@@ -557,6 +581,7 @@ impl LocalExecutor {
         Ok(())
     }
 
+    #[cfg(not(feature = "xdp"))]
     fn new(id: usize, io_memory: usize) -> LocalExecutor {
         let p = parking::Parker::new();
         LocalExecutor {
@@ -564,6 +589,18 @@ impl LocalExecutor {
             parker: p,
             id,
             reactor: Rc::new(parking::Reactor::new(io_memory)),
+        }
+    }
+
+    #[cfg(feature = "xdp")]
+    fn new(id: usize, io_memory: usize, config: XdpConfig) -> LocalExecutor {
+        let p = parking::Parker::new();
+        let umem = ebpf::Umem::new(config.umem_descriptors, config.into()).unwrap();
+        LocalExecutor {
+            queues: ExecutorQueues::new(),
+            parker: p,
+            id,
+            reactor: Rc::new(parking::Reactor::new(io_memory, umem)),
         }
     }
 

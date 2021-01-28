@@ -193,6 +193,8 @@ fn cstr(path: &Path) -> io::Result<CString> {
 }
 
 mod dma_buffer;
+#[cfg(feature = "xdp")]
+pub(crate) mod ebpf;
 pub(crate) mod sysfs;
 mod uring;
 
@@ -257,7 +259,8 @@ pub(crate) enum SourceType {
     Timeout(TimeSpec64),
     Connect(SockAddr),
     Accept(SockAddrStorage),
-    Poll,
+    XskPoll,
+    XskKickTx,
     Invalid,
 }
 

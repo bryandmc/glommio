@@ -23,7 +23,7 @@
 //!
 
 use ahash::AHashMap;
-use iou::{PollFlags, SockAddr, SockAddrStorage};
+use iou::{MsgFlags, PollFlags, SockAddr, SockAddrStorage};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
@@ -42,9 +42,14 @@ use std::time::{Duration, Instant};
 
 use futures_lite::*;
 
-use crate::sys;
-use crate::sys::{DirectIO, DmaBuffer, IOBuffer, PollableStatus, Source, SourceType};
+#[cfg(feature = "xdp")]
+use crate::sys::ebpf;
+
 use crate::Local;
+use crate::{
+    sys::{self, DirectIO, DmaBuffer, IOBuffer, PollableStatus, Source, SourceType},
+    GlommioError,
+};
 use crate::{IoRequirements, Latency};
 
 /// Waits for a notification.
@@ -243,9 +248,29 @@ pub(crate) struct Reactor {
     /// every time. Acquire during initialization
     preempt_ptr_head: *const u32,
     preempt_ptr_tail: *const AtomicU32,
+
+    #[cfg(feature = "xdp")]
+    pub(crate) xdp_umem: Rc<RefCell<ebpf::Umem>>,
 }
 
 impl Reactor {
+    #[cfg(feature = "xdp")]
+    pub(crate) fn new(io_memory: usize, umem: ebpf::Umem) -> Reactor {
+        let sys = sys::Reactor::new(io_memory).expect("cannot initialize I/O event notification");
+        let (preempt_ptr_head, preempt_ptr_tail) = sys.preempt_pointers();
+        Reactor {
+            sys,
+            timers: RefCell::new(Timers::new()),
+            shared_channels: RefCell::new(SharedChannels::new()),
+            current_io_requirements: Cell::new(IoRequirements::default()),
+            wakers: RefCell::new(Vec::with_capacity(256)),
+            preempt_ptr_head,
+            preempt_ptr_tail: preempt_ptr_tail as _,
+            xdp_umem: Rc::new(RefCell::new(umem)),
+        }
+    }
+
+    #[cfg(not(feature = "xdp"))]
     pub(crate) fn new(io_memory: usize) -> Reactor {
         let sys = sys::Reactor::new(io_memory).expect("cannot initialize I/O event notification");
         let (preempt_ptr_head, preempt_ptr_tail) = sys.preempt_pointers();
@@ -377,9 +402,36 @@ impl Reactor {
 
     pub(crate) fn poll(&self, fd: RawFd, flags: PollFlags) -> Source {
         println!("Entering rushed poll..");
-        let source = self.new_source(fd, SourceType::Poll);
+        self.inform_io_requirements(IoRequirements::new(
+            Latency::Matters(Duration::from_millis(1)),
+            0,
+        ));
+        let source = self.new_source(fd, SourceType::XskPoll);
         self.sys.poll(&source, flags);
         source
+    }
+
+    pub(crate) fn kick_tx(&self, fd: RawFd) -> Source {
+        println!("Kicking TX for fd: {}.", fd);
+        // self.inform_io_requirements(IoRequirements::new(
+        //     Latency::Matters(Duration::from_millis(1)),
+        //     0,
+        // ));
+        let source = self.new_source(fd, SourceType::XskKickTx);
+        // dbg!(&source);
+        self.sys.kick_tx(&source);
+        source
+    }
+
+    pub(crate) fn kick_tx_sync(
+        &self,
+        fd: RawFd,
+        sock: &libbpf_sys::xsk_socket,
+    ) -> Result<Source, GlommioError<()>> {
+        println!("Kicking TX ... XDP should send.");
+        let source = self.new_source(fd, SourceType::XskKickTx);
+        self.sys.kick_tx_sync(&source, sock)?;
+        Ok(source)
     }
 
     pub(crate) fn rushed_recvmsg(
@@ -563,6 +615,13 @@ impl Reactor {
         self.sys.rush_dispatch(None, &mut wakers)?;
         self.process_timers(&mut wakers);
         self.process_shared_channels(&mut wakers);
+
+        if cfg!(feature = "xdp") {
+            // println!("XDP feature enabled!");
+            let mut umem = self.xdp_umem.borrow_mut();
+            umem.maybe_consume_completions();
+            umem.maybe_fill_descriptors();
+        }
 
         let woke = wakers.len();
         for waker in wakers.drain(..) {

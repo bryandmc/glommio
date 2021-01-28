@@ -13,6 +13,9 @@ keywords = ["uring", "reactor", "thread-per-core"]
 categories = ["asynchronous", "os"]
 readme = "../README.md"
 
+[features]
+xdp = ["libbpf-sys", "bitflags"]
+
 [dependencies]
 log = "0.4"
 concurrent-queue = "1.1.2"
@@ -35,8 +38,8 @@ buddy-alloc = "0.4.1"
 ahash = "0.5.7"
 intrusive-collections = "0.9.0"
 thiserror = "1.0"
-libbpf-sys = "0.1.0-1"
-bitflags = "1.2.1"
+libbpf-sys = { version = "0.1.0-1", optional = true }
+bitflags = { version = "1.2.1", optional = true }
 
 [dev-dependencies]
 futures = "0.3.5"
