@@ -10,11 +10,13 @@ use core::{fmt, slice};
 use libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_HUGETLB, MAP_PRIVATE, PROT_READ, PROT_WRITE};
 use std::{
     cell::{Cell, RefCell},
-    cmp,
-    collections::{HashSet, VecDeque},
+    cmp::{self, Ordering},
+    collections::VecDeque,
     convert::TryInto,
     ffi::CString,
     io,
+    mem::ManuallyDrop,
+    net::Ipv4Addr,
     ops::{Index, IndexMut},
     os::unix::prelude::{IntoRawFd, RawFd},
     ptr,
@@ -59,7 +61,7 @@ bitflags! {
 
 /// # AF_XDP socket
 ///
-// AF_XDP socket for delivering layer 2 frames directly to userspace from very early in
+/// AF_XDP socket for delivering layer 2 frames directly to userspace from very early in
 /// the kernel networking stack. So early, it's basically in the drivers code directly
 /// and can even operate in a `zero-copy` fashion.
 ///
@@ -113,8 +115,6 @@ impl XskSocketDriver {
         let umem_ptr = unsafe { umem.borrow_mut().inner_umem_mut_ptr() };
         let rx_ptr = Box::into_raw(rx);
         let tx_ptr = Box::into_raw(tx);
-
-        dbg!(umem_ptr);
         let err = unsafe {
             libbpf_sys::xsk_socket__create(
                 xsk_ptr,
@@ -165,9 +165,9 @@ impl XskSocketDriver {
             for desc in descriptors.iter_mut().take(count_usize) {
                 let rx_descriptor =
                     libbpf_sys::_xsk_ring_cons__rx_desc(self.rx_queue.as_ref(), idx);
-                desc.addr = (*rx_descriptor).addr;
-                desc.len = (*rx_descriptor).len;
-                desc.options = (*rx_descriptor).options;
+                desc.addr.set((*rx_descriptor).addr);
+                desc.len.set((*rx_descriptor).len);
+                desc.options.set((*rx_descriptor).options);
                 idx += 1;
             }
             libbpf_sys::_xsk_ring_cons__release(self.rx_queue.as_mut(), count);
@@ -192,10 +192,10 @@ impl XskSocketDriver {
                 let rx_descriptor =
                     libbpf_sys::_xsk_ring_cons__rx_desc(self.rx_queue.as_ref(), idx);
                 let frame: FrameRef = (*rx_descriptor).into();
-                println!(
-                    "Consuming descriptor: '{}' (index: {}, frame len: {})",
-                    frame.addr, idx, frame.len
-                );
+                // println!(
+                //     "Consuming descriptor: '{}' (index: {}, frame len: {})",
+                //     frame.addr, idx, frame.len
+                // );
                 recv_descriptors.push(frame);
                 idx += 1;
             }
@@ -218,9 +218,9 @@ impl XskSocketDriver {
             }
             for desc in descriptors {
                 let x = libbpf_sys::_xsk_ring_prod__tx_desc(self.tx_queue.as_mut(), idx);
-                (*x).addr = desc.addr;
-                (*x).len = desc.len;
-                (*x).options = desc.options;
+                (*x).addr = desc.addr.get();
+                (*x).len = desc.len.get();
+                (*x).options = desc.options.get();
                 desc.in_queue = true;
                 idx += 1;
             }
@@ -250,13 +250,7 @@ impl XskSocketDriver {
                     "TX queue free slots: {}. (attempted: {}, retry: {})",
                     free_space, attempted_nb, retries
                 );
-                // println!(
-                //     "TX QUEUE: consumer: {}, producer: {}. Cached: ( consumer: {}, producer: {} )",
-                //     *self.tx_queue.consumer,
-                //     *self.tx_queue.producer,
-                //     self.tx_queue.cached_cons,
-                //     self.tx_queue.cached_cons
-                // );
+
                 if free_space == 0 {
                     return (0, None);
                 }
@@ -284,23 +278,21 @@ impl XskSocketDriver {
             for desc in usable_descriptors {
                 let x = libbpf_sys::_xsk_ring_prod__tx_desc(self.tx_queue.as_mut(), idx);
                 {
-                    let fr = &mut desc.inner.borrow_mut().frame;
-                    (*x).addr = fr.addr;
-                    (*x).len = fr.len;
-                    (*x).options = fr.options;
-                    fr.in_queue = true;
+                    let fr = &desc.inner.frame;
+                    (*x).addr = fr.addr.get();
+                    (*x).len = fr.len.get();
+                    (*x).options = fr.options.get();
+                    // fr.in_queue = true;
                 }
                 pending.push_back(desc);
                 idx += 1;
             }
             libbpf_sys::_xsk_ring_prod__submit(self.tx_queue.as_mut(), count);
             if count > 0 && self.tx_needs_wakeup() {
-                println!("Count: {}", count);
                 let mut sources = vec![];
                 let r = 0..((count / 16) + 1);
                 dbg!(r);
                 for i in 0..((count / 16) + 1) {
-                    println!("Kicking for the {}/{} time.", i + 1, ((count / 16) + 2));
                     sources.push(self.kick_tx());
                 }
                 return (count.try_into().unwrap(), Some(sources));
@@ -310,33 +302,17 @@ impl XskSocketDriver {
     }
 
     pub(crate) fn tx_needs_wakeup(&self) -> bool {
-        unsafe {
-            let need_wakeup = libbpf_sys::_xsk_ring_prod__needs_wakeup(self.tx_queue.as_ref());
-            println!("Need wakeup == {}", need_wakeup);
-            need_wakeup != 0
-        }
+        unsafe { libbpf_sys::_xsk_ring_prod__needs_wakeup(self.tx_queue.as_ref()) != 0 }
     }
 
     pub(crate) fn fill_needs_wakeup(&self) -> bool {
         unsafe {
-            let need_wakeup =
-                libbpf_sys::_xsk_ring_prod__needs_wakeup(self.umem.borrow().fill_queue.as_ref());
-            println!("Need wakeup == {}", need_wakeup);
-            need_wakeup != 0
+            libbpf_sys::_xsk_ring_prod__needs_wakeup(self.umem.borrow().fill_queue.as_ref()) != 0
         }
     }
 
     pub(crate) fn kick_tx(&self) -> Option<Source> {
         Some(self.reactor.upgrade()?.kick_tx(self.fd))
-    }
-
-    pub(crate) fn kick_tx_sync(&self) -> Option<Source> {
-        Some(
-            self.reactor
-                .upgrade()?
-                .kick_tx_sync(self.fd, self.socket.as_ref())
-                .ok()?,
-        )
     }
 
     pub(crate) fn rx_count(&mut self) -> usize {
@@ -377,6 +353,102 @@ impl Drop for XskSocketDriver {
             libbpf_sys::xsk_socket__delete(self.socket.as_mut());
         }
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct Cursor<T: Eq + PartialEq + Copy + Ord + PartialOrd> {
+    start: Cell<T>,
+    end: Cell<T>,
+    tuple: Cell<(T, T)>,
+}
+
+// or ...
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct RingCursor<T: Copy + fmt::Debug> {
+    start: T,
+    end: T,
+}
+
+struct CCursor {
+    fill: Cell<(u32, u32)>,
+    rx: Cell<(u32, u32)>,
+    tx: Cell<(u32, u32)>,
+    completion: Cell<(u32, u32)>,
+}
+
+enum CursorRange {
+    Free(u32, u32, Option<Box<CursorRange>>),
+    Fill(u32, u32, Option<Box<CursorRange>>),
+    Rx(u32, u32, Option<Box<CursorRange>>),
+    Tx(u32, u32, Option<Box<CursorRange>>),
+    Completion(u32, u32, Option<Box<CursorRange>>),
+}
+
+enum ReadRingCursor {
+    Free(u32, u32, Option<Box<CursorRange>>),
+    Fill(u32, u32, Option<Box<CursorRange>>),
+    Rx(u32, u32, Option<Box<CursorRange>>),
+}
+
+enum WriteRingCursor {
+    Free(u32, u32, Option<Box<CursorRange>>),
+    Tx(u32, u32, Option<Box<CursorRange>>),
+    Completion(u32, u32, Option<Box<CursorRange>>),
+}
+
+impl CursorRange {
+    fn something() {
+        let free = CursorRange::Free(10, 100, None);
+        let fill = CursorRange::Fill(0, 10, Some(Box::new(free)));
+        fn inner(cursor: CursorRange) {
+            match cursor {
+                CursorRange::Free(free_start, free_end, Some(next)) => inner(*next),
+                CursorRange::Fill(fill_start, fill_end, Some(next)) => inner(*next),
+                CursorRange::Rx(_, _, Some(next)) => inner(*next),
+                _ => {}
+            }
+        }
+    }
+}
+
+impl CCursor {
+    fn advance_fill(&self, amt: u32) {
+        let fill = self.fill.get();
+        self.fill.set((fill.0, fill.1 + amt));
+    }
+}
+
+impl<T: Eq + PartialEq + Copy + Ord + PartialOrd> Ord for Cursor<T> {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        let (start, end) = (self.start.get(), self.end.get());
+        let (other_start, other_end) = (other.start.get(), other.end.get());
+        if end < other_end && end < other_start {
+            return Ordering::Less;
+        }
+        Ordering::Equal
+    }
+}
+
+impl<T: Eq + PartialEq + Copy + Ord + PartialOrd> PartialOrd for Cursor<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        todo!()
+    }
+}
+
+trait Curse {
+    fn overlaps(&self, other: Self) -> bool;
+}
+
+impl<T: Copy + fmt::Debug> Curse for RingCursor<T> {
+    fn overlaps(&self, other: Self) -> bool {
+        todo!()
+    }
+}
+
+struct TestUse {
+    fill_ring: Cell<RingCursor<u32>>,
+    rx_ring: Cursor<u32>,
 }
 
 /// # UMEM memory region
@@ -440,8 +512,6 @@ impl Umem {
         // Create the actual UMEM
         dbg!(unsafe { *ffi_config });
         let err = unsafe {
-            // unsafe { *ffi_config }.fill_size = 10_000;
-            // unsafe { *ffi_config }.comp_size = 10_000;
             libbpf_sys::xsk_umem__create(umem_ptr, mem_ptr, size, fq_ptr, cq_ptr, ffi_config)
         };
 
@@ -461,9 +531,9 @@ impl Umem {
             VecDeque::with_capacity(num_descriptors.try_into()?);
         for i in 0..num_descriptors {
             descriptors.push_back(FrameRef {
-                addr: (i as u64) * (config.frame_size as u64),
-                len: 0,
-                options: 0,
+                addr: Cell::new((i as u64) * (config.frame_size as u64)),
+                len: Cell::new(0),
+                options: Cell::new(0),
                 in_queue: false,
             });
         }
@@ -479,8 +549,15 @@ impl Umem {
                 frame_size: PAGE_SIZE,
                 fd: fd.into_raw_fd(),
                 free_list: descriptors,
-                pending_completions: VecDeque::new(),
+
+                // Allocated with a full capacity of 5000 because (hopefully) it won't need to grow
+                // beyond that, and so that we aren't constantly reallocating or allocating.
+                pending_completions: VecDeque::with_capacity(5000),
+
+                // Threshold is half the full size
                 fill_threshold: config.fill_size / 2,
+
+                // Threshold for when to reap completions
                 completions_threshold: 0,
             })
         }
@@ -507,16 +584,10 @@ impl Umem {
 
     pub(crate) fn completions_ready(&mut self) -> usize {
         unsafe {
-            let avail = libbpf_sys::_xsk_cons_nb_avail(
+            libbpf_sys::_xsk_cons_nb_avail(
                 self.completion_queue.as_mut(),
                 self.completion_queue.size,
-            ) as usize;
-            let consumer = *self.completion_queue.consumer;
-            let producer = *self.completion_queue.producer;
-            // dbg!(avail, consumer, producer);
-            // (producer - consumer) as usize
-
-            avail
+            ) as usize
         }
     }
 
@@ -563,40 +634,13 @@ impl Umem {
             let addr = unsafe {
                 *libbpf_sys::_xsk_ring_cons__comp_addr(self.completion_queue.as_mut(), idx)
             };
-            println!("Computing address for {} = {}", desc.addr, addr);
-            desc.addr = addr;
-            desc.len = 0;
-            desc.options = 0;
+            println!("Computing address for {} = {}", desc.addr.get(), addr);
+            desc.addr.set(addr);
+            desc.len.set(0);
+            desc.options.set(0);
             idx += 1;
         }
         unsafe { libbpf_sys::_xsk_ring_cons__release(self.completion_queue.as_mut(), count) };
-        count.try_into().unwrap()
-    }
-
-    pub(crate) fn consume_completions_slice(&mut self, descriptors: &mut [FrameBuf]) -> usize {
-        let nb = descriptors.len().try_into().unwrap();
-        let mut idx = 0;
-        let count = unsafe {
-            libbpf_sys::_xsk_ring_cons__peek(self.completion_queue.as_mut(), nb, &mut idx)
-        };
-        println!(
-            "There are {} entries in completion queue. Idx: {}, nb: {}",
-            count, idx, nb
-        );
-        if count > 0 {
-            for desc in descriptors.iter_mut() {
-                let addr = unsafe {
-                    *libbpf_sys::_xsk_ring_cons__comp_addr(self.completion_queue.as_mut(), idx)
-                };
-                let mut fr = desc.inner.borrow_mut();
-                println!("Computing address for {} = {}", fr.frame.addr, addr);
-                fr.frame.addr = addr;
-                fr.frame.len = 0;
-                fr.frame.options = 0;
-                idx += 1;
-            }
-            unsafe { libbpf_sys::_xsk_ring_cons__release(self.completion_queue.as_mut(), count) };
-        }
         count.try_into().unwrap()
     }
 
@@ -607,38 +651,37 @@ impl Umem {
         let count = unsafe {
             libbpf_sys::_xsk_ring_cons__peek(self.completion_queue.as_mut(), size_hint, &mut idx)
         };
-        println!(
-            "There are {} entries in completion queue ({}). Idx: {}",
-            count, nb, idx
-        );
         let mut i = 0;
         for _ in 0..count {
-            if let Some(desc) = self.pending_completions.pop_back() {
-                let addr = unsafe {
-                    *libbpf_sys::_xsk_ring_cons__comp_addr(self.completion_queue.as_mut(), idx)
-                };
-                {
-                    let mut descriptor = desc.inner.borrow_mut();
-                    println!("Computing address for {} = {}", descriptor.frame.addr, addr);
-                    descriptor.frame.addr = addr;
-                    descriptor.frame.len = 0;
-                    descriptor.frame.options = 0;
-                    idx += 1;
+            match self.pending_completions.pop_back() {
+                Some(desc) => {
+                    let addr = unsafe {
+                        *libbpf_sys::_xsk_ring_cons__comp_addr(self.completion_queue.as_mut(), idx)
+                    };
+                    {
+                        let mut descriptor = &desc.inner;
+                        // println!("Computing address for {} = {}", descriptor.frame.addr, addr);
+                        descriptor.frame.addr.set(addr);
+                        descriptor.frame.len.set(0);
+                        descriptor.frame.options.set(0);
+                        idx += 1;
+                    }
+
+                    let frame = desc.inner.frame.clone();
+                    // let frame = FrameRef {
+                    //     addr: bfr.addr.get(),
+                    //     len: bfr.len.get(),
+                    //     options: bfr.options.get(),
+                    //     in_queue: bfr.in_queue,
+                    // };
+                    self.free_list.push_back(frame);
+                    i += 1;
+                    let x = ManuallyDrop::new(desc);
                 }
-                let frame = FrameRef {
-                    ..desc.inner.borrow().frame
-                };
-                let before = self.free_list.len();
-                println!(
-                    "Pushing '{:?}' onto free list. Len before: {}",
-                    frame, before
-                );
-                self.free_list.push_back(frame);
-                i += 1;
-                println!("... after len: {}", self.free_list.len());
-            } else {
-                println!("********** ERROR **********");
-                println!("pending: {}", self.pending_completions.len());
+                None => {
+                    println!("********** ERROR **********");
+                    println!("pending: {}", self.pending_completions.len());
+                }
             }
         }
         println!("Going to release {} entries..", i);
@@ -686,11 +729,7 @@ impl Umem {
         for frame in descriptors {
             unsafe {
                 let f = libbpf_sys::_xsk_ring_prod__fill_addr(self.fill_queue.as_mut(), idx);
-                println!(
-                    "Setting 'f': {:?} w/ idx: {}, addr: {}",
-                    *f, idx, frame.addr
-                );
-                *f = frame.addr
+                *f = frame.addr.get()
             };
             idx += 1;
         }
@@ -794,14 +833,14 @@ impl Default for UmemConfig {
 }
 
 /// FrameRef - reference to individual UMEM frames.
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameRef {
     /// The starting address of the frame
-    pub(crate) addr: u64,
+    pub(crate) addr: Cell<u64>,
     /// The length of the frame inside the UMEM region
-    pub(crate) len: u32,
+    pub(crate) len: Cell<u32>,
     /// Options for the frame
-    pub(crate) options: u32,
+    pub(crate) options: Cell<u32>,
 
     pub(crate) in_queue: bool,
 }
@@ -810,7 +849,7 @@ impl FrameRef {
     /// Get the underlying FrameBuf for this FrameRef
     pub fn get_buffer(self, umem: Rc<RefCell<Umem>>) -> FrameBuf {
         FrameBuf {
-            inner: Rc::new(RefCell::new(InnerBuf { umem, frame: self })),
+            inner: Rc::new(InnerBuf { umem, frame: self }),
         }
     }
 }
@@ -915,10 +954,34 @@ where
 /// TODO: Figure out a way to make it safe to access these without accidentally
 /// having multiple mutable copies or something like that.
 pub struct FrameBuf {
-    pub(crate) inner: Rc<RefCell<InnerBuf>>,
+    pub(crate) inner: Rc<InnerBuf>,
 }
 
 impl FrameBuf {
+    pub fn frame_addr(&self) -> u64 {
+        self.inner.frame.addr.get()
+    }
+
+    pub fn set_frame_addr(&mut self, addr: u64) {
+        self.inner.frame.addr.set(addr);
+    }
+
+    pub fn frame_len(&self) -> u32 {
+        self.inner.frame.len.get()
+    }
+
+    pub fn set_frame_len(&mut self, len: u32) {
+        self.inner.frame.len.set(len);
+    }
+
+    pub fn frame_options(&self) -> u32 {
+        self.inner.frame.options.get()
+    }
+
+    pub fn set_frame_options(&mut self, options: u32) {
+        self.inner.frame.options.set(options);
+    }
+
     /// L2 MAC destination slice
     pub fn mac_dst(&self) -> &[u8] {
         &self[..6]
@@ -940,15 +1003,140 @@ impl FrameBuf {
     }
 
     /// The ethertype of the frame
-    pub fn ether_type(&self) -> u16 {
+    pub fn ether_type_raw(&self) -> u16 {
         let arr: [u8; 2] = self[12..14].try_into().unwrap();
         u16::from_be_bytes(arr)
+    }
+
+    pub fn ether_type(&self) -> EtherType {
+        match self.ether_type_raw() {
+            0x0800 => EtherType::Ipv4,
+            0x86dd => EtherType::Ipv6,
+            0x0806 => EtherType::Arp,
+            0x0842 => EtherType::WakeOnLan,
+            0x8100 => EtherType::VlanTaggedFrame,
+            0x88A8 => EtherType::ProviderBridging,
+            0x9100 => EtherType::VlanDoubleTaggedFrame,
+            et => panic!("Invalid ethertype value! Got: {}", et),
+        }
     }
 
     /// Mutable access to the ethertype
     pub fn set_ether_type(&mut self, ether_type: u16) {
         let arr = ether_type.to_be_bytes();
         self[12..14].copy_from_slice(&arr);
+    }
+
+    pub fn ip_header_len(&self) -> u8 {
+        (self[14] & 0b00001111) * 4
+    }
+
+    pub fn ip_tos(&self) -> u8 {
+        self[15]
+    }
+
+    pub fn ip_total_size(&self) -> &[u8] {
+        &self[16..18]
+    }
+
+    pub fn ip_identification(&self) -> &[u8] {
+        &self[18..20]
+    }
+
+    pub fn ip_fragment_offset(&self) -> &[u8] {
+        &self[20..22]
+    }
+
+    pub fn ip_ttl(&self) -> u8 {
+        self[22]
+    }
+
+    pub fn ip_protocol(&self) -> u8 {
+        self[23]
+    }
+
+    pub fn ip_checksum(&self) -> &[u8] {
+        &self[24..26]
+    }
+
+    pub fn ip_src_raw(&self) -> &[u8] {
+        &self[26..30]
+    }
+
+    pub fn ip_src(&self) -> Ipv4Addr {
+        u32::from_be_bytes(self.ip_src_raw().try_into().unwrap()).into()
+    }
+
+    pub fn ip_src_mut(&mut self) -> &mut [u8] {
+        &mut self[26..30]
+    }
+
+    pub fn set_ip_src(&mut self, ip: Ipv4Addr) {
+        let ip_le: u32 = ip.into();
+        self.ip_src_mut().copy_from_slice(&ip_le.to_be_bytes());
+    }
+
+    pub fn ip_dst_raw(&self) -> &[u8] {
+        &self[30..34]
+    }
+
+    pub fn ip_dst(&self) -> Ipv4Addr {
+        u32::from_be_bytes(self.ip_dst_raw().try_into().unwrap()).into()
+    }
+
+    pub fn ip_dst_mut(&mut self) -> &mut [u8] {
+        &mut self[30..34]
+    }
+
+    pub fn set_ip_dst(&mut self, ip: Ipv4Addr) {
+        let ip_le: u32 = ip.into();
+        self.ip_dst_mut().copy_from_slice(&ip_le.to_be_bytes());
+    }
+
+    pub fn ip_options(&self) -> &[u8] {
+        &self[34..38]
+    }
+
+    pub fn calculate_ipv4_csum(&mut self) {
+        let ip_header = &self[14..(14 + self.ip_header_len()) as usize];
+        let mut result = 0xffffu32;
+
+        for idx in 0..(self.ip_header_len() / 2) {
+            if idx == 6 {
+                println!(
+                    "Skipping idx {} with slice value: {:#0X?}",
+                    idx,
+                    &ip_header[2 * (idx as usize)..(2 * idx as usize) + 2]
+                );
+                continue;
+            }
+            println!(
+                "Calculating idx {} with slice value: {:#0X?}",
+                idx,
+                &ip_header[2 * (idx as usize)..(2 * idx as usize) + 2]
+            );
+
+            let sixteen_chunk = u16::from_be_bytes(
+                ip_header[2 * (idx as usize)..(2 * idx as usize) + 2]
+                    .try_into()
+                    .unwrap(),
+            );
+            result += sixteen_chunk as u32;
+
+            if result > 0xffff {
+                println!("Result greater than 0xFFFF! Subtracting that amount.");
+                result -= 0xffff;
+            }
+            println!("iteration: {}, result: {:#0X?}", idx, result);
+        }
+
+        dbg!(&ip_header, ip_header.len(),);
+        self[24..26].copy_from_slice(&(!result as u16).to_be_bytes());
+        println!(
+            "Slice: {:0x?}, checksum: {:#0X?}",
+            &self[14..(14 + self.ip_header_len()) as usize],
+            self.ip_checksum()
+        );
     }
 }
 
@@ -969,16 +1157,28 @@ impl fmt::Debug for InnerBuf {
     }
 }
 
-impl Clone for FrameBuf {
-    fn clone(&self) -> Self {
-        FrameBuf {
-            inner: self.inner.clone(),
-        }
-    }
+// impl Clone for FrameBuf {
+//     fn clone(&self) -> Self {
+//         FrameBuf {
+//             inner: self.inner.clone(),
+//         }
+//     }
+// }
+
+///Ether type enum present in ethernet II header.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EtherType {
+    Ipv4 = 0x0800,
+    Ipv6 = 0x86dd,
+    Arp = 0x0806,
+    WakeOnLan = 0x0842,
+    VlanTaggedFrame = 0x8100,
+    ProviderBridging = 0x88A8,
+    VlanDoubleTaggedFrame = 0x9100,
 }
 
 pub(crate) struct InnerBuf {
-    umem: Rc<RefCell<Umem>>,
+    pub(crate) umem: Rc<RefCell<Umem>>,
     pub(crate) frame: FrameRef,
 }
 
@@ -986,15 +1186,18 @@ impl std::ops::Deref for FrameBuf {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        let inner = self.inner.borrow();
-        let mut umem = inner.umem.borrow();
+        let inner = &self.inner;
+        // println!("Before Deref for frame: {:?}", inner.frame);
+        let umem = inner.umem.borrow();
+
+        // println!("After Deref for frame: {:?}", inner.frame);
         unsafe {
             slice::from_raw_parts(
                 umem.memory
                     .as_ptr()
-                    .offset(inner.frame.addr as isize)
+                    .offset(inner.frame.addr.get() as isize)
                     .cast::<u8>(),
-                inner.frame.len as usize,
+                inner.frame.len.get() as usize,
             )
         }
     }
@@ -1005,37 +1208,34 @@ impl std::ops::DerefMut for FrameBuf {
         // TODO: We may have to eventually remove the refcell wrapper because it could
         // be too easy to trip on, when we know it's actually probably safe to just give
         // out the slice assuming we don't make multiple ways to access this exact slice.
-        let inner = self.inner.borrow_mut();
+        let inner = &self.inner;
+        // println!("Before DerefMut for frame: {:?}", inner.frame);
         let mut umem = inner.umem.borrow_mut();
-        unsafe {
+
+        let res = unsafe {
             slice::from_raw_parts_mut(
                 umem.memory
                     .as_mut_ptr()
-                    .offset(inner.frame.addr as isize)
+                    .offset(inner.frame.addr.get() as isize)
                     .cast::<u8>(),
-                inner.frame.len as usize,
+                inner.frame.len.get() as usize,
             )
-        }
+        };
+        // println!(
+        //     "After (but still borrowed) DerefMut for frame: {:?}",
+        //     inner.frame
+        // );
+        res
     }
 }
 
-// impl Drop for InnerBuf {
-//     fn drop(&mut self) {
-//         println!("Dropping FrameBuf and putting back into free list");
-//         let copied = FrameRef {
-//             addr: self.frame.addr,
-//             len: self.frame.len,
-//             options: self.frame.options,
-//             in_queue: false,
-//         };
-//         println!("FRAME: {:?}", copied);
-//         self.umem.borrow_mut().free_list.push_back(copied);
-//         println!(
-//             "FREE LIST LENGTH: {}",
-//             self.umem.borrow_mut().free_list.len()
-//         );
-//     }
-// }
+impl Drop for FrameBuf {
+    fn drop(&mut self) {
+        let copied = self.inner.frame.clone();
+        println!("Dropping FrameBuf: {:?}", copied);
+        self.inner.umem.borrow_mut().free_list.push_back(copied);
+    }
+}
 
 /// Xsk socket configuration
 ///
@@ -1154,9 +1354,9 @@ impl From<XskSocketConfig> for xsk_socket_config {
 impl From<libbpf_sys::xdp_desc> for FrameRef {
     fn from(desc: libbpf_sys::xdp_desc) -> Self {
         FrameRef {
-            addr: desc.addr,
-            len: desc.len,
-            options: desc.options,
+            addr: Cell::new(desc.addr),
+            len: Cell::new(desc.len),
+            options: Cell::new(desc.options),
             in_queue: false,
         }
     }
@@ -1165,9 +1365,9 @@ impl From<libbpf_sys::xdp_desc> for FrameRef {
 impl From<FrameRef> for libbpf_sys::xdp_desc {
     fn from(frame: FrameRef) -> Self {
         libbpf_sys::xdp_desc {
-            addr: frame.addr,
-            len: frame.len,
-            options: frame.options,
+            addr: frame.addr.get(),
+            len: frame.len.get(),
+            options: frame.options.get(),
         }
     }
 }
@@ -1182,7 +1382,7 @@ pub(crate) mod tests {
         time::Duration,
     };
 
-    use crate::{LocalExecutor, LocalExecutorBuilder};
+    use crate::LocalExecutorBuilder;
     use lazy_static::lazy_static;
     use std::sync::Mutex;
 
@@ -1193,9 +1393,55 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn frame_buf_drop_requeue() {
+        let umem = Rc::new(RefCell::new(
+            Umem::new(10, UmemConfig::default().into()).unwrap(),
+        ));
+        let ptr = Rc::into_raw(umem);
+
+        let mut fb = FrameBuf {
+            inner: Rc::new(InnerBuf {
+                umem: unsafe { Rc::from_raw(ptr) },
+                frame: FrameRef {
+                    addr: Cell::new(0),
+                    len: Cell::new(42),
+                    options: Cell::new(0),
+                    in_queue: false,
+                },
+            }),
+        };
+
+        let inner = unsafe { &*ptr };
+        let pending = &inner.borrow().pending_completions;
+    }
+
+    #[test]
+    fn frame_buf_ip_header_csum() {
+        let umem = Rc::new(RefCell::new(
+            Umem::new(10, UmemConfig::default().into()).unwrap(),
+        ));
+        let mut fb = FrameBuf {
+            inner: Rc::new(InnerBuf {
+                umem,
+                frame: FrameRef {
+                    addr: Cell::new(0),
+                    len: Cell::new(42),
+                    options: Cell::new(0),
+                    in_queue: false,
+                },
+            }),
+        };
+        fb[16..].copy_from_slice(b"abcdefghijklmnopqrstuvwxyz");
+        fb[14] = 0x45;
+        let out = fb.ip_header_len();
+        dbg!(out);
+        fb.calculate_ipv4_csum();
+    }
+
+    #[test]
     #[cfg_attr(not(feature = "xdp"), ignore)]
     fn af_xdp_umem_produce_fill() -> Result<()> {
-        let guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
+        let _guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
         let umem = Rc::new(RefCell::new(Umem::new(10, UmemConfig::default().into())?));
         dbg!(
             &umem,
@@ -1215,7 +1461,7 @@ pub(crate) mod tests {
         unsafe {
             let count = libbpf_sys::_xsk_prod_nb_free(umem.borrow_mut().fill_queue.as_mut(), 10);
             dbg!(&count);
-            dbg!((umem.borrow().fill_queue.size - count as u32));
+            dbg!(umem.borrow().fill_queue.size - count as u32);
         }
         dbg!(
             umem.borrow().fill_queue.cached_prod,
@@ -1230,6 +1476,7 @@ pub(crate) mod tests {
 
         let fill_len_cached = umem.borrow_mut().fill_count_cached();
         dbg!(fill_len_cached);
+        let pack = SlicedPacket::from_ethernet(&[]).unwrap();
         assert_eq!(fill_len_cached, 5);
         Ok(())
     }
@@ -1248,7 +1495,7 @@ pub(crate) mod tests {
         std::process::Command::new("ip")
             .stdout(Stdio::null())
             .args(&[
-                "netns", "exec", "test", "nping", "--udp", "-c", "1000000", "--rate", "10000",
+                "netns", "exec", "test", "nping", "--udp", "-c", "1000000", "--rate", "1000000",
                 "10.1.0.2",
             ])
             .spawn()
@@ -1260,7 +1507,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg_attr(not(feature = "xdp"), ignore)]
     fn af_xdp_tx() -> Result<()> {
-        let guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
+        let _guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
         let config = UmemConfig::default();
         let umem = Rc::new(RefCell::new(Umem::new(NUM_DESCRIPTORS, config.into())?));
         let sock_config = XskSocketConfig::builder()
@@ -1398,7 +1645,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg_attr(not(feature = "xdp"), ignore)]
     fn af_xdp_rx() -> Result<()> {
-        let guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
+        let _guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
         let config = UmemConfig::default();
         let umem = Rc::new(RefCell::new(Umem::new(NUM_DESCRIPTORS, config.into())?));
         let sock_config = XskSocketConfig::builder()
@@ -1471,7 +1718,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg_attr(not(feature = "xdp"), ignore)]
     fn af_xdp_construct_xdp_socket() -> Result<()> {
-        let guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
+        let _guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
         let config = UmemConfig::default();
         let umem = Rc::new(RefCell::new(Umem::new(NUM_DESCRIPTORS, config.into())?));
         let sock_config = XskSocketConfig::builder()
@@ -1500,7 +1747,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg_attr(not(feature = "xdp"), ignore)]
     fn construct_umem() -> Result<()> {
-        let guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
+        let _guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
         let config = UmemConfig::default();
         let umem = Umem::new(NUM_DESCRIPTORS, config.into())?;
         dbg!(umem);
@@ -1515,6 +1762,7 @@ pub(crate) mod tests {
         let just_two = &mm[..2];
         let mutable_range = &mut mm[1..8];
         dbg!(&mutable_range);
+
         std::thread::sleep(Duration::from_secs(10));
     }
 
@@ -1527,5 +1775,61 @@ pub(crate) mod tests {
         let output = &mm[1..8];
         assert_eq!(output, b"abcdefg");
         assert_eq!(mm[..].len(), 4096 * 10);
+    }
+
+    #[derive(Debug)]
+    enum SomeADT {
+        First(usize),
+        Second,
+        Third(u8, u16),
+    }
+
+    #[derive(Debug)]
+    struct HugePagesStruct {
+        a: usize,
+        b: String,
+        c: SomeADT,
+    }
+
+    fn isboxcopy<T: Copy>(item: T) {}
+
+    #[test]
+    #[cfg_attr(not(feature = "xdp"), ignore)]
+    fn create_huge_page_struct() {
+        let mut b = Box::new(String::new());
+        let x = b.as_mut_ptr();
+        isboxcopy(x);
+
+        let prot = PROT_READ | PROT_WRITE;
+        let file = -1;
+        let offset = 0;
+        let mut flags = MAP_ANONYMOUS | MAP_PRIVATE | MAP_HUGETLB;
+
+        let mem_ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                std::mem::size_of::<HugePagesStruct>(),
+                prot,
+                flags,
+                file,
+                offset as libc::off_t,
+            )
+        };
+
+        unsafe {
+            std::ptr::write(
+                mem_ptr.cast::<HugePagesStruct>(),
+                HugePagesStruct {
+                    a: 0,
+                    b: "basic string..".to_string(),
+                    c: SomeADT::Third(10, 100),
+                },
+            )
+        };
+        let hps = unsafe { Box::from_raw(mem_ptr.cast::<HugePagesStruct>()) };
+        dbg!(mem_ptr, &hps);
+        std::thread::sleep(Duration::from_secs(10));
+        let munmap = Box::into_raw(hps);
+        unsafe { libc::munmap(munmap.cast(), std::mem::size_of::<HugePagesStruct>()) };
     }
 }

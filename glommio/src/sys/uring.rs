@@ -894,9 +894,6 @@ impl UringCommon for SleepableRing {
 
     fn submit_sqes(&mut self) -> io::Result<usize> {
         let x = self.ring.submit_sqes()?;
-        if x > 0 {
-            println!("Submitted {} SQE's..", x);
-        }
         self.waiting_submission -= x;
         Ok(x)
     }
@@ -1153,34 +1150,6 @@ impl Reactor {
     pub(crate) fn kick_tx(&self, source: &Source) {
         let op = UringOpDescriptor::SockSend(ptr::null(), 0, MsgFlags::empty().bits());
         self.queue_standard_request(source, op);
-    }
-
-    /// Just calls sendto synchonously. Makes a single synchronous call to kick the TX side.
-    /// This is probably the lowest latency way to start TX processing, but at the expense of
-    /// a guaranteed system call.
-    ///
-    /// The *async* variant might be a better choice for the common case.
-    pub(crate) fn kick_tx_sync(
-        &self,
-        source: &Source,
-        sock: &libbpf_sys::xsk_socket,
-    ) -> io::Result<()> {
-        let res = unsafe { libc::sendto(source.raw(), ptr::null(), 0, 0, ptr::null(), 0) };
-        let last_err = Error::last_os_error();
-        println!(
-            "Kicking TX Result: {} for fd: {}, last_os_error: {}",
-            res,
-            source.raw(),
-            last_err,
-        );
-
-        if res >= 0 {
-            let err = Error::from_raw_os_error(-res as i32);
-            eprintln!("Error 'kicking' sends.. Error: {}", err);
-            eprintln!("Last error: {}", last_err);
-            return Err(err);
-        }
-        Ok(())
     }
 
     pub(crate) fn recv(&self, source: &Source, len: usize, flags: MsgFlags) {

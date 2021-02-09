@@ -23,7 +23,7 @@
 //!
 
 use ahash::AHashMap;
-use iou::{MsgFlags, PollFlags, SockAddr, SockAddrStorage};
+use iou::{PollFlags, SockAddr, SockAddrStorage};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
@@ -45,11 +45,9 @@ use futures_lite::*;
 #[cfg(feature = "xdp")]
 use crate::sys::ebpf;
 
+use crate::sys::{self, DirectIO, DmaBuffer, IOBuffer, PollableStatus, Source, SourceType};
+use crate::GlommioError;
 use crate::Local;
-use crate::{
-    sys::{self, DirectIO, DmaBuffer, IOBuffer, PollableStatus, Source, SourceType},
-    GlommioError,
-};
 use crate::{IoRequirements, Latency};
 
 /// Waits for a notification.
@@ -401,37 +399,15 @@ impl Reactor {
     }
 
     pub(crate) fn poll(&self, fd: RawFd, flags: PollFlags) -> Source {
-        println!("Entering rushed poll..");
-        self.inform_io_requirements(IoRequirements::new(
-            Latency::Matters(Duration::from_millis(1)),
-            0,
-        ));
         let source = self.new_source(fd, SourceType::XskPoll);
         self.sys.poll(&source, flags);
         source
     }
 
     pub(crate) fn kick_tx(&self, fd: RawFd) -> Source {
-        println!("Kicking TX for fd: {}.", fd);
-        // self.inform_io_requirements(IoRequirements::new(
-        //     Latency::Matters(Duration::from_millis(1)),
-        //     0,
-        // ));
         let source = self.new_source(fd, SourceType::XskKickTx);
-        // dbg!(&source);
         self.sys.kick_tx(&source);
         source
-    }
-
-    pub(crate) fn kick_tx_sync(
-        &self,
-        fd: RawFd,
-        sock: &libbpf_sys::xsk_socket,
-    ) -> Result<Source, GlommioError<()>> {
-        println!("Kicking TX ... XDP should send.");
-        let source = self.new_source(fd, SourceType::XskKickTx);
-        self.sys.kick_tx_sync(&source, sock)?;
-        Ok(source)
     }
 
     pub(crate) fn rushed_recvmsg(
@@ -619,9 +595,11 @@ impl Reactor {
         if cfg!(feature = "xdp") {
             // println!("XDP feature enabled!");
             let mut umem = self.xdp_umem.borrow_mut();
+            // println!("BORROWED AS MUT IN RT..");
             umem.maybe_consume_completions();
             umem.maybe_fill_descriptors();
         }
+        // println!("FINISHED borrowed ..");
 
         let woke = wakers.len();
         for waker in wakers.drain(..) {

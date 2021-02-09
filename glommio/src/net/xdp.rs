@@ -13,6 +13,7 @@ use crate::{
     GlommioError, Local,
 };
 use std::{cell::RefCell, rc::Rc};
+use std::{convert::TryInto, mem::ManuallyDrop};
 
 type Result<T> = std::result::Result<T, GlommioError<()>>;
 
@@ -55,7 +56,7 @@ pub struct XdpSocket {
 }
 
 impl XdpSocket {
-    const DEFAULT_RX_BATCH: u64 = 1000;
+    const DEFAULT_RX_BATCH: u64 = 5_000;
 
     fn new(config: XdpConfig) -> Result<XdpSocket> {
         dbg!(&config);
@@ -141,8 +142,7 @@ impl XdpSocket {
                 if total > 0 && self.driver.tx_needs_wakeup() {
                     if let Some(sources) = outer_sources {
                         if let Some(Some(last)) = sources.last() {
-                            let async_wait = last.collect_rw().await;
-                            dbg!(async_wait);
+                            let _ = last.collect_rw().await?;
                         }
                     }
                 }
@@ -165,8 +165,7 @@ impl XdpSocket {
         if amt > 0 && self.driver.tx_needs_wakeup() {
             if let Some(sources) = outer_sources {
                 if let Some(Some(last)) = sources.last() {
-                    let async_wait = last.collect_rw().await;
-                    dbg!(async_wait);
+                    let _ = last.collect_rw().await?;
                 }
             }
         }
@@ -180,7 +179,7 @@ impl XdpSocket {
         let full_size = umem.frame_size();
         umem.free_list.pop_front().map(|mut x| {
             // NOTE: setting this to full size gives us access to the full frame area
-            x.len = full_size;
+            x.len.set(full_size);
             x.get_buffer(self.umem.clone())
         })
     }
@@ -193,7 +192,7 @@ impl XdpSocket {
             .drain(..amt)
             .map(|mut x| {
                 // NOTE: setting this to full size gives us access to the full frame area
-                x.len = full_size;
+                x.len.set(full_size);
                 x.get_buffer(self.umem.clone())
             })
             .collect()
@@ -258,33 +257,38 @@ pub struct XdpConfigBuilder {
 impl XdpConfigBuilder {
     /// set which interface the socket is for
     ///
-    pub fn if_name(self, name: &'static str) -> XdpConfigBuilder {
+    pub const fn if_name(self, name: &'static str) -> XdpConfigBuilder {
         Self {
             if_name: Some(name),
             ..self
         }
     }
     /// Size of the tx ring.
-    pub fn tx_size(self, tx_size: u32) -> XdpConfigBuilder {
-        dbg!(!(tx_size & (4096 - 1)));
-        assert!(tx_size & (4096 - 1) == 0);
-        XdpConfigBuilder { tx_size, ..self }
+    pub const fn tx_size(self, tx_size: u32) -> XdpConfigBuilder {
+        // dbg!(!(tx_size & (4096 - 1)));
+        if tx_size & (4096 - 1) == 0 {
+            return XdpConfigBuilder { tx_size, ..self };
+        }
+        XdpConfigBuilder { ..self }
     }
 
     /// Size of the rx ring.
-    pub fn rx_size(self, rx_size: u32) -> XdpConfigBuilder {
-        dbg!(!(rx_size & (4096 - 1)));
-        assert!(rx_size & (4096 - 1) == 0);
-        XdpConfigBuilder { rx_size, ..self }
+    pub const fn rx_size(self, rx_size: u32) -> XdpConfigBuilder {
+        // dbg!(!(rx_size & (4096 - 1)));
+        if rx_size & (4096 - 1) == 0 {
+            // panic!("Must be divisible by the page size");
+            return XdpConfigBuilder { rx_size, ..self };
+        }
+        XdpConfigBuilder { ..self }
     }
 
     /// Which queue to attach to.
-    pub fn queue(self, queue: u32) -> XdpConfigBuilder {
+    pub const fn queue(self, queue: u32) -> XdpConfigBuilder {
         XdpConfigBuilder { queue, ..self }
     }
 
     /// What `XDP` flags to use when setting up the socket
-    pub fn xdp_flags(self, xdp_flags: XdpFlags) -> XdpConfigBuilder {
+    pub const fn xdp_flags(self, xdp_flags: XdpFlags) -> XdpConfigBuilder {
         XdpConfigBuilder {
             xdp_flags: xdp_flags.bits(),
             ..self
@@ -292,7 +296,7 @@ impl XdpConfigBuilder {
     }
 
     /// What `bind` flags to use when setting up the socket
-    pub fn bind_flags(self, bind_flags: XskBindFlags) -> XdpConfigBuilder {
+    pub const fn bind_flags(self, bind_flags: XskBindFlags) -> XdpConfigBuilder {
         XdpConfigBuilder {
             bind_flags: bind_flags.bits(),
             ..self
@@ -300,7 +304,7 @@ impl XdpConfigBuilder {
     }
 
     /// What `libbpf` flags to use when setting up the socket
-    pub fn libbpf_flags(self, libbpf_flags: u32) -> XdpConfigBuilder {
+    pub const fn libbpf_flags(self, libbpf_flags: u32) -> XdpConfigBuilder {
         XdpConfigBuilder {
             libbpf_flags,
             ..self
@@ -308,28 +312,35 @@ impl XdpConfigBuilder {
     }
 
     /// Fill size
-    pub fn fill_size(self, fill_size: u32) -> XdpConfigBuilder {
-        dbg!(!(fill_size & (4096 - 1)));
-        assert!(fill_size & (4096 - 1) == 0);
+    pub const fn fill_size(self, fill_size: u32) -> XdpConfigBuilder {
+        // dbg!(!(fill_size & (4096 - 1)));
+        // assert!();
         // assert!(fill_size & (4096 - 1));
-        XdpConfigBuilder { fill_size, ..self }
+        if fill_size & (4096 - 1) == 0 {
+            return XdpConfigBuilder { fill_size, ..self };
+        }
+        XdpConfigBuilder { ..self }
     }
 
     /// Completion size
-    pub fn completion_size(self, comp_size: u32) -> XdpConfigBuilder {
-        dbg!(comp_size & (4096 - 1));
-        assert!(comp_size & (4096 - 1) == 0);
+    pub const fn completion_size(self, comp_size: u32) -> XdpConfigBuilder {
+        // dbg!(comp_size & (4096 - 1));
+        // assert!();
+        if comp_size & (4096 - 1) == 0 {
+            return XdpConfigBuilder { comp_size, ..self };
+        }
         // assert!(comp_size & (4096 - 1));
-        XdpConfigBuilder { comp_size, ..self }
+
+        XdpConfigBuilder { ..self }
     }
 
     /// Frame size
-    pub fn frame_size(self, frame_size: u32) -> XdpConfigBuilder {
+    pub const fn frame_size(self, frame_size: u32) -> XdpConfigBuilder {
         XdpConfigBuilder { frame_size, ..self }
     }
 
     /// Frame headroom
-    pub fn frame_headroom(self, frame_headroom: u32) -> XdpConfigBuilder {
+    pub const fn frame_headroom(self, frame_headroom: u32) -> XdpConfigBuilder {
         XdpConfigBuilder {
             frame_headroom,
             ..self
@@ -337,12 +348,12 @@ impl XdpConfigBuilder {
     }
 
     /// UMEM flags
-    pub fn umem_flags(self, umem_flags: u32) -> XdpConfigBuilder {
+    pub const fn umem_flags(self, umem_flags: u32) -> XdpConfigBuilder {
         XdpConfigBuilder { umem_flags, ..self }
     }
 
     /// Number of UMEM descriptors
-    pub fn umem_descriptors(self, umem_descriptors: u32) -> XdpConfigBuilder {
+    pub const fn umem_descriptors(self, umem_descriptors: u32) -> XdpConfigBuilder {
         XdpConfigBuilder {
             umem_descriptors,
             ..self
@@ -371,7 +382,7 @@ impl XdpConfigBuilder {
 
 impl XdpConfig {
     /// Create XDP socket configuration builder
-    pub fn builder(if_name: &'static str, queue: u32) -> XdpConfigBuilder {
+    pub const fn builder(if_name: &'static str, queue: u32) -> XdpConfigBuilder {
         XdpConfigBuilder {
             fill_size: libbpf_sys::XSK_RING_PROD__DEFAULT_NUM_DESCS,
             comp_size: libbpf_sys::XSK_RING_CONS__DEFAULT_NUM_DESCS,
@@ -454,17 +465,23 @@ mod tests {
     use std::time::Duration;
 
     use super::super::sys::ebpf::tests::{run_ping_command, run_udp_traffic_command, XDP_LOCK};
-    use crate::LocalExecutorBuilder;
+    use crate::{sys::ebpf::EtherType, LocalExecutorBuilder};
 
     use super::*;
+
+    const XDP_CONFIG: XdpConfigBuilder = XdpConfig::builder("veth1", 0)
+        .umem_descriptors(4096)
+        .fill_size(1024)
+        .completion_size(1024)
+        .rx_size(1024)
+        .tx_size(1024);
 
     #[test]
     #[cfg_attr(not(feature = "xdp"), ignore)]
     fn af_xdp_umem_get_buffers() {
-        let guard = XDP_LOCK.lock().unwrap();
+        let _guard = XDP_LOCK.lock().unwrap();
         let builder = LocalExecutorBuilder::default();
-        let local = builder.make().unwrap();
-        let mut cmd = run_ping_command();
+        let local = builder.xdp_config(XDP_CONFIG.build()).make().unwrap();
         local.run(async move {
             let mut sock = XdpSocket::bind("veth1", 0).unwrap();
             dbg!(&sock);
@@ -476,19 +493,11 @@ mod tests {
     #[test]
     #[cfg_attr(not(feature = "xdp"), ignore)]
     fn af_xdp_umem_get_buffer() {
-        let guard = XDP_LOCK.lock().unwrap();
+        let _guard = XDP_LOCK.lock().unwrap();
         let builder = LocalExecutorBuilder::default();
-        let local = builder.make().unwrap();
-        let mut cmd = run_ping_command();
+        let local = builder.xdp_config(XDP_CONFIG.build()).make().unwrap();
         local.run(async move {
-            let mut sock = XdpSocket::bind_with_config(
-                XdpConfig::builder("veth1", 0)
-                    .umem_descriptors(10_240)
-                    .fill_size(2 * 4096)
-                    .completion_size(2 * 4096)
-                    .build(),
-            )
-            .unwrap();
+            let mut sock = XdpSocket::bind_with_config(XDP_CONFIG.build()).unwrap();
             dbg!(&sock);
             let buff = sock.get_buffer();
             dbg!(&buff);
@@ -501,7 +510,7 @@ mod tests {
     #[test]
     #[cfg_attr(not(feature = "xdp"), ignore)]
     fn af_xdp_socket_send() {
-        let guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
+        let _guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
         let config = XdpConfig::builder("veth1", 0)
             .umem_descriptors(20 * 4096)
             .fill_size(4 * 4096)
@@ -518,33 +527,62 @@ mod tests {
             .make()
             .unwrap();
         let mut cmd = run_udp_traffic_command();
+        let mut cmd2 = run_udp_traffic_command();
+        let mut cmd3 = run_udp_traffic_command();
         local.run(async move {
             let mut sock = XdpSocket::bind_with_config(config).unwrap();
             dbg!(&sock);
-            for x in 0..200 {
-                // crate::timer::sleep(Duration::from_millis(150)).await;
+            for _ in 0..300 {
+                // crate::timer::sleep(Duration::from_millis(10)).await;
                 let mut frames = sock.recv().await.unwrap();
                 // let buff = sock.get_buffer().unwrap();
                 // println!("BUFFER: {:?}", &buff[..]);
                 // frames.push(buff);
+                if let Some(first) = frames.get_mut(0) {
+                    let src_mac = first.mac_src().to_vec();
+                    let dst_mac = first.mac_dst().to_vec();
+                    if let EtherType::Ipv4 = first.ether_type() {
+                        let out = first.ip_header_len();
+                        let ipv = ( first[14] & 0b11110000 ) >> 4;
+                        println!("Got frame of ether type: {:?} ({}), header size {} \
+                                  ( {:08b} ) = {}", first.ether_type(), ipv, first[14], first[14], out);
+                        println!("Got frame with data -- src: {:?}, dst: {:?}", first.ip_src(), first.ip_dst());
+                        if let [a, b, c, d, e, f] = dst_mac[..] {
+                            if let [g, h, i, j, k, l] = src_mac[..] {
+                                println!(
+                                    "Swapped dst mac: [ {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} ] with source mac \
+                                     [ {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} ]",
+                                    a, b, c, d, e, f, g, h, i, j, k, l
+                                );
+                            }
+                        }
+                    }
+
+                    first.mac_dst_mut().copy_from_slice(&src_mac);
+                    first.mac_src_mut().copy_from_slice(&dst_mac);
+                    let dst_ip = first.ip_dst_raw().to_vec();
+                    let src_ip = first.ip_src_raw().to_vec();
+                    first.ip_dst_mut().copy_from_slice(&src_ip);
+                    first.ip_src_mut().copy_from_slice(&dst_ip);
+                }
                 let resp = sock.send(&mut frames).await.unwrap();
-                dbg!(
-                    resp,
-                    &sock.umem.borrow().pending_completions.len(),
-                    &sock.umem.borrow().free_list.len()
-                );
+                println!("Sent {} items. Pending completions queue: {}, free descriptor queue: {}",
+                         resp, sock.umem.borrow().pending_completions.len(), sock.umem.borrow().free_list.len());
             }
             dbg!(&sock.umem.borrow().pending_completions.len());
         });
         cmd.kill().unwrap();
+        cmd2.kill().unwrap();
+        cmd3.kill().unwrap();
     }
 
     #[test]
     #[cfg_attr(not(feature = "xdp"), ignore)]
     fn af_xdp_socket_recv() {
-        let guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
+        let _guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
         let builder = LocalExecutorBuilder::default();
-        let local = builder.make().unwrap();
+        let conf = XdpConfig::builder("veth1", 0).umem_descriptors(10).build();
+        let local = builder.xdp_config(conf).make().unwrap();
         let mut cmd = run_ping_command();
         std::thread::sleep(Duration::from_secs(2));
         local.run(async move {
@@ -561,9 +599,10 @@ mod tests {
     #[test]
     #[cfg_attr(not(feature = "xdp"), ignore)]
     fn af_xdp_create_socket() {
-        let guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
+        let _guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
         let builder = LocalExecutorBuilder::default();
-        let local = builder.make().unwrap();
+        let conf = XdpConfig::builder("veth1", 0).umem_descriptors(10).build();
+        let local = builder.xdp_config(conf).make().unwrap();
 
         local.run(async move {
             // let sock = XdpSocket::bind("veth1", 0);

@@ -440,7 +440,8 @@ impl LocalExecutorBuilder {
         let mut le = LocalExecutor::new(
             EXECUTOR_ID.fetch_add(1, Ordering::Relaxed),
             self.io_memory,
-            self.xdp_config.unwrap(),
+            self.xdp_config
+                .expect("ERROR must create XDP config in executor builder before using it."),
         );
         #[cfg(not(feature = "xdp"))]
         let mut le =
