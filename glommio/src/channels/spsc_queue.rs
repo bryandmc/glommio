@@ -1,13 +1,34 @@
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::fmt;
-use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-const CACHELINE_LEN: usize = 64;
+#[derive(Debug)]
+#[repr(align(64))]
+struct ProducerCacheline {
+    /// The bounded size as specified by the user.
+    capacity: usize,
 
-const fn cacheline_pad(used: usize) -> usize {
-    CACHELINE_LEN / std::mem::size_of::<usize>() - used
+    /// Index position of current tail
+    tail: AtomicUsize,
+    shadow_head: Cell<usize>,
+    /// Id == 0 : never connected
+    /// Id == usize::MAX: disconnected
+    consumer_id: AtomicUsize,
+}
+
+#[derive(Debug)]
+#[repr(align(64))]
+struct ConsumerCacheline {
+    /// The bounded size as specified by the user.
+    capacity: usize,
+
+    /// Index position of the current head
+    head: AtomicUsize,
+    shadow_tail: Cell<usize>,
+    /// Id == 0 : never connected
+    /// Id == usize::MAX: disconnected
+    producer_id: AtomicUsize,
 }
 
 /// The internal memory buffer used by the queue.
@@ -16,95 +37,108 @@ const fn cacheline_pad(used: usize) -> usize {
 /// ring buffer, as well as a head and tail atomicUsize which the producer and consumer
 /// use to track location in the ring.
 #[repr(C)]
-pub(crate) struct Buffer<T: Copy> {
-    buffer_storage: Arc<Vec<Cell<T>>>,
+pub(crate) struct Buffer<T> {
+    buffer_storage: Vec<UnsafeCell<T>>,
 
-    /// The bounded size as specified by the user.  If the queue reaches capacity, it will block
-    /// until values are poppped off.
-    capacity: usize,
-
-    /// The allocated size of the ring buffer, in terms of number of values (not physical memory).
-    /// This will be the next power of two larger than `capacity`
-    allocated_size: usize,
-    _padding1: [usize; cacheline_pad(3)],
-
-    /// Consumer cacheline:
-
-    /// Index position of the current head
-    head: AtomicUsize,
-    shadow_tail: Cell<usize>,
-    producer_disconnected: AtomicUsize,
-    producer_eventfd: Cell<Option<Arc<AtomicUsize>>>,
-    _padding2: [usize; cacheline_pad(4)],
-
-    /// Producer cacheline:
-
-    /// Index position of current tail
-    tail: AtomicUsize,
-    shadow_head: Cell<usize>,
-    consumer_disconnected: AtomicUsize,
-    consumer_eventfd: Cell<Option<Arc<AtomicUsize>>>,
-    _padding3: [usize; cacheline_pad(4)],
+    pcache: ProducerCacheline,
+    ccache: ConsumerCacheline,
 }
 
-impl<T: Copy> fmt::Debug for Buffer<T> {
+impl<T> fmt::Debug for Buffer<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Relaxed);
-        let shead = self.shadow_head.get();
-        let consumer_disconnected = self.consumer_disconnected.load(Ordering::Relaxed) != 0;
-        let producer_disconnected = self.producer_disconnected.load(Ordering::Relaxed) != 0;
+        let head = self.ccache.head.load(Ordering::Relaxed);
+        let tail = self.pcache.tail.load(Ordering::Relaxed);
+        let shead = self.pcache.shadow_head.get();
+        let stail = self.ccache.shadow_tail.get();
+        let id_to_str = |id| match id {
+            0 => "not connected".into(),
+            usize::MAX => "disconnected".into(),
+            x => format!("{}", x),
+        };
+
+        let consumer_id = id_to_str(self.pcache.consumer_id.load(Ordering::Relaxed));
+        let producer_id = id_to_str(self.ccache.producer_id.load(Ordering::Relaxed));
 
         f.debug_struct("SPSC Buffer")
-            .field("capacity:", &self.capacity)
-            .field("allocated_size:", &self.allocated_size)
+            .field("capacity:", &self.ccache.capacity)
             .field("consumer_head:", &head)
-            .field("producer_tail:", &tail)
             .field("shadow_head:", &shead)
-            .field("consumer_disconnected:", &consumer_disconnected)
-            .field("producer_disconnected:", &producer_disconnected)
+            .field("producer_tail:", &tail)
+            .field("shadow_tail:", &stail)
+            .field("consumer_id:", &consumer_id)
+            .field("producer_id:", &producer_id)
             .finish()
     }
 }
 
-unsafe impl<T: Sync + Copy> Sync for Buffer<T> {}
+unsafe impl<T: Sync> Sync for Buffer<T> {}
 
 /// A handle to the queue which allows consuming values from the buffer
-#[derive(Debug)]
-pub(crate) struct Consumer<T: Copy> {
-    buffer: Arc<Buffer<T>>,
+pub(crate) struct Consumer<T> {
+    pub(crate) buffer: Arc<Buffer<T>>,
+}
+
+impl<T> Clone for Consumer<T> {
+    fn clone(&self) -> Self {
+        Consumer {
+            buffer: self.buffer.clone(),
+        }
+    }
 }
 
 /// A handle to the queue which allows adding values onto the buffer
-#[derive(Debug)]
-pub(crate) struct Producer<T: Copy> {
-    buffer: Arc<Buffer<T>>,
+pub(crate) struct Producer<T> {
+    pub(crate) buffer: Arc<Buffer<T>>,
 }
 
-unsafe impl<T: Send + Copy> Send for Consumer<T> {}
-unsafe impl<T: Send + Copy> Send for Producer<T> {}
+impl<T> Clone for Producer<T> {
+    fn clone(&self) -> Self {
+        Producer {
+            buffer: self.buffer.clone(),
+        }
+    }
+}
 
-impl<T: Copy> Buffer<T> {
+impl<T> fmt::Debug for Consumer<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Consumer {:?}", self.buffer)
+    }
+}
+
+impl<T> fmt::Debug for Producer<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Producer {:?}", self.buffer)
+    }
+}
+
+unsafe impl<T: Send> Send for Consumer<T> {}
+unsafe impl<T: Send> Send for Producer<T> {}
+
+impl<T> Buffer<T> {
     /// Attempt to pop a value off the buffer.
     ///
     /// If the buffer is empty, this method will not block.  Instead, it will return `None`
     /// signifying the buffer was empty.  The caller may then decide what to do next (e.g. spin-wait,
     /// sleep, process something else, etc)
     fn try_pop(&self) -> Option<T> {
-        let current_head = self.head.load(Ordering::Relaxed);
+        let current_head = self.ccache.head.load(Ordering::Relaxed);
 
-        if current_head == self.shadow_tail.get() {
-            self.shadow_tail.set(self.tail.load(Ordering::Acquire));
-            if current_head == self.shadow_tail.get() {
+        if current_head == self.ccache.shadow_tail.get() {
+            self.ccache
+                .shadow_tail
+                .set(self.pcache.tail.load(Ordering::Acquire));
+            if current_head == self.ccache.shadow_tail.get() {
                 return None;
             }
         }
 
-        let index = current_head & (self.allocated_size - 1);
-        let v = self.buffer_storage[index].get();
-        self.head
-            .store(current_head.wrapping_add(1), Ordering::Release);
-        Some(v)
+        let resp = unsafe {
+            self.buffer_storage[current_head % self.ccache.capacity]
+                .get()
+                .read()
+        };
+        self.ccache.head.store(current_head + 1, Ordering::Release);
+        Some(resp)
     }
 
     /// Attempt to push a value onto the buffer.
@@ -113,43 +147,47 @@ impl<T: Copy> Buffer<T> {
     /// `v` was the value attempting to be pushed onto the buffer.  If the value was successfully
     /// pushed onto the buffer, `None` will be returned signifying success.
     fn try_push(&self, v: T) -> Option<T> {
-        if self.consumer_disconnected.load(Ordering::Acquire) > 0 {
+        if self.consumer_disconnected() {
             return Some(v);
         }
-        let current_tail = self.tail.load(Ordering::Relaxed);
+        let current_tail = self.pcache.tail.load(Ordering::Relaxed);
 
-        if self.shadow_head.get() + self.capacity <= current_tail {
-            self.shadow_head.set(self.head.load(Ordering::Relaxed));
-            if self.shadow_head.get() + self.capacity <= current_tail {
+        if self.pcache.shadow_head.get() + self.pcache.capacity <= current_tail {
+            self.pcache
+                .shadow_head
+                .set(self.ccache.head.load(Ordering::Acquire));
+            if self.pcache.shadow_head.get() + self.pcache.capacity <= current_tail {
                 return Some(v);
             }
         }
 
-        let index = current_tail & (self.allocated_size - 1);
-        self.buffer_storage[index].set(v);
-        self.tail
-            .store(current_tail.wrapping_add(1), Ordering::Release);
+        unsafe {
+            self.buffer_storage[current_tail % self.pcache.capacity]
+                .get()
+                .write(v);
+        }
+        self.pcache.tail.store(current_tail + 1, Ordering::Release);
         None
     }
 
     /// Disconnects the consumer, and returns whether or not it was already disconnected
     pub(crate) fn disconnect_consumer(&self) -> bool {
-        self.consumer_disconnected.swap(1, Ordering::Release) != 0
+        self.pcache.consumer_id.swap(usize::MAX, Ordering::Release) == usize::MAX
     }
 
     /// Disconnects the consumer, and returns whether or not it was already disconnected
     pub(crate) fn disconnect_producer(&self) -> bool {
-        self.producer_disconnected.swap(1, Ordering::Release) != 0
+        self.ccache.producer_id.swap(usize::MAX, Ordering::Release) == usize::MAX
     }
 
     /// Disconnects the consumer, and returns whether or not it was already disconnected
     pub(crate) fn producer_disconnected(&self) -> bool {
-        self.producer_disconnected.load(Ordering::Acquire) != 0
+        self.ccache.producer_id.load(Ordering::Acquire) == usize::MAX
     }
 
     /// Disconnects the consumer, and returns whether or not it was already disconnected
     pub(crate) fn consumer_disconnected(&self) -> bool {
-        self.consumer_disconnected.load(Ordering::Acquire) != 0
+        self.pcache.consumer_id.load(Ordering::Acquire) == usize::MAX
     }
 
     /// Returns the current size of the queue
@@ -157,12 +195,12 @@ impl<T: Copy> Buffer<T> {
     /// This value represents the current size of the queue.  This value can be from 0-`capacity`
     /// inclusive.
     pub(crate) fn size(&self) -> usize {
-        self.tail.load(Ordering::Acquire) - self.head.load(Ordering::Acquire)
+        self.pcache.tail.load(Ordering::Acquire) - self.ccache.head.load(Ordering::Acquire)
     }
 }
 
 /// Handles deallocation of heap memory when the buffer is dropped
-impl<T: Copy> Drop for Buffer<T> {
+impl<T> Drop for Buffer<T> {
     fn drop(&mut self) {
         // Pop the rest of the values off the queue.  By moving them into this scope,
         // we implicitly call their destructor
@@ -171,34 +209,34 @@ impl<T: Copy> Drop for Buffer<T> {
         // any of the constructors through the vector. And whatever object was
         // in fact still alive we popped above.
         unsafe {
-            match Arc::get_mut(&mut self.buffer_storage) {
-                Some(storage) => storage.set_len(0),
-                None => unreachable!(),
-            }
+            self.buffer_storage.set_len(0);
         }
     }
 }
 
-pub(crate) fn make<T: Copy>(capacity: usize) -> (Producer<T>, Consumer<T>) {
+pub(crate) fn make<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
+    inner_make(capacity, 0)
+}
+
+fn inner_make<T>(capacity: usize, initial_value: usize) -> (Producer<T>, Consumer<T>) {
     let buffer_storage = allocate_buffer(capacity);
 
     let arc = Arc::new(Buffer {
         buffer_storage,
-        capacity,
-        allocated_size: capacity.next_power_of_two(),
-        _padding1: [0; cacheline_pad(3)],
-        _padding2: [0; cacheline_pad(4)],
-        _padding3: [0; cacheline_pad(4)],
+        ccache: ConsumerCacheline {
+            capacity,
 
-        head: AtomicUsize::new(0),
-        shadow_tail: Cell::new(0),
-        producer_disconnected: AtomicUsize::new(0),
-        producer_eventfd: Cell::new(None),
+            head: AtomicUsize::new(initial_value),
+            shadow_tail: Cell::new(initial_value),
+            producer_id: AtomicUsize::new(0),
+        },
+        pcache: ProducerCacheline {
+            capacity,
 
-        tail: AtomicUsize::new(0),
-        shadow_head: Cell::new(0),
-        consumer_disconnected: AtomicUsize::new(0),
-        consumer_eventfd: Cell::new(None),
+            tail: AtomicUsize::new(initial_value),
+            shadow_head: Cell::new(initial_value),
+            consumer_id: AtomicUsize::new(0),
+        },
     });
 
     (
@@ -209,45 +247,27 @@ pub(crate) fn make<T: Copy>(capacity: usize) -> (Producer<T>, Consumer<T>) {
     )
 }
 
-fn allocate_buffer<T: Copy>(capacity: usize) -> Arc<Vec<Cell<T>>> {
+fn allocate_buffer<T>(capacity: usize) -> Vec<UnsafeCell<T>> {
     let size = capacity.next_power_of_two();
     let mut vec = Vec::with_capacity(size);
     unsafe {
         vec.set_len(size);
     }
-    Arc::new(vec)
+    vec
 }
 
 pub(crate) trait BufferHalf {
-    type Item: Copy;
+    type Item;
 
     fn buffer(&self) -> &Buffer<Self::Item>;
-    fn eventfd(&self) -> &Cell<Option<Arc<AtomicUsize>>>;
-    fn opposite_eventfd(&self) -> &Cell<Option<Arc<AtomicUsize>>>;
-
-    fn must_notify(&self) -> Option<RawFd> {
-        let eventfd = self.opposite_eventfd();
-        let mem = eventfd.take();
-        let ret = mem.as_ref().map(|x| x.load(Ordering::Acquire) as _);
-        eventfd.set(mem);
-        match ret {
-            None | Some(0) => None,
-            Some(x) => Some(x),
-        }
-    }
-
-    fn connect(&self, eventfd: Arc<AtomicUsize>) {
-        let old = self.eventfd().replace(Some(eventfd));
-        assert_eq!(old.is_none(), true);
-    }
+    fn connect(&self, id: usize);
+    fn peer_id(&self) -> usize;
 
     /// Returns the total capacity of this queue
     ///
     /// This value represents the total capacity of the queue when it is full.  It does not
     /// represent the current usage.  For that, call `size()`.
-    fn capacity(&self) -> usize {
-        self.buffer().capacity
-    }
+    fn capacity(&self) -> usize;
 
     /// Returns the current size of the queue
     ///
@@ -258,20 +278,31 @@ pub(crate) trait BufferHalf {
     }
 }
 
-impl<T: Copy> BufferHalf for Producer<T> {
+impl<T> BufferHalf for Producer<T> {
     type Item = T;
     fn buffer(&self) -> &Buffer<T> {
         &*self.buffer
     }
-    fn eventfd(&self) -> &Cell<Option<Arc<AtomicUsize>>> {
-        &(*self.buffer).producer_eventfd
+
+    fn capacity(&self) -> usize {
+        (*self.buffer).pcache.capacity
     }
-    fn opposite_eventfd(&self) -> &Cell<Option<Arc<AtomicUsize>>> {
-        &(*self.buffer).consumer_eventfd
+
+    fn connect(&self, id: usize) {
+        assert_ne!(id, 0);
+        assert_ne!(id, usize::MAX);
+        (*self.buffer)
+            .ccache
+            .producer_id
+            .store(id, Ordering::Release);
+    }
+
+    fn peer_id(&self) -> usize {
+        (*self.buffer).pcache.consumer_id.load(Ordering::Acquire)
     }
 }
 
-impl<T: Copy> Producer<T> {
+impl<T> Producer<T> {
     /// Attempt to push a value onto the buffer.
     ///
     /// This method does not block.  If the queue is not full, the value will be added to the
@@ -286,7 +317,6 @@ impl<T: Copy> Producer<T> {
     ///
     /// Returns the buffer status before the disconnect
     pub(crate) fn disconnect(&self) -> bool {
-        (*self.buffer).producer_eventfd.set(None);
         (*self.buffer).disconnect_producer()
     }
 
@@ -303,26 +333,36 @@ impl<T: Copy> Producer<T> {
     }
 }
 
-impl<T: Copy> BufferHalf for Consumer<T> {
+impl<T> BufferHalf for Consumer<T> {
     type Item = T;
     fn buffer(&self) -> &Buffer<T> {
         &(*self.buffer)
     }
-    fn eventfd(&self) -> &Cell<Option<Arc<AtomicUsize>>> {
-        &(*self.buffer).consumer_eventfd
+
+    fn connect(&self, id: usize) {
+        assert_ne!(id, usize::MAX);
+        assert_ne!(id, 0);
+        (*self.buffer)
+            .pcache
+            .consumer_id
+            .store(id, Ordering::Release);
     }
-    fn opposite_eventfd(&self) -> &Cell<Option<Arc<AtomicUsize>>> {
-        &(*self.buffer).producer_eventfd
+
+    fn peer_id(&self) -> usize {
+        (*self.buffer).ccache.producer_id.load(Ordering::Acquire)
+    }
+
+    fn capacity(&self) -> usize {
+        (*self.buffer).ccache.capacity
     }
 }
 
-impl<T: Copy> Consumer<T> {
+impl<T> Consumer<T> {
     /// Disconnects the consumer, signaling to the producer that no new values are going to be
     /// consumed. After this is done, any attempt on the producer to try_push should fail
     ///
     /// Returns the buffer status before the disconnect
     pub(crate) fn disconnect(&self) -> bool {
-        (*self.buffer).consumer_eventfd.set(None);
         (*self.buffer).disconnect_consumer()
     }
 
@@ -344,11 +384,6 @@ impl<T: Copy> Consumer<T> {
 mod tests {
     use super::*;
     use std::thread;
-
-    #[test]
-    fn test_buffer_size() {
-        assert_eq!(::std::mem::size_of::<Buffer<()>>(), 3 * CACHELINE_LEN);
-    }
 
     #[test]
     fn test_try_push() {
@@ -411,6 +446,20 @@ mod tests {
                     break;
                 }
             }
+        }
+    }
+
+    #[should_panic]
+    #[test]
+    fn test_wrap() {
+        let (p, c) = super::inner_make(10, usize::MAX - 1);
+
+        for i in 0..10 {
+            assert_eq!(p.try_push(i).is_none(), true);
+        }
+
+        for i in 0..10 {
+            assert_eq!(c.try_pop(), Some(i));
         }
     }
 }

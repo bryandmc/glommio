@@ -40,12 +40,16 @@ intrusive-collections = "0.9.0"
 thiserror = "1.0"
 libbpf-sys = { version = "0.1.0-1", optional = true }
 bitflags = { version = "1.2.1", optional = true }
+membarrier = "0.2.2"
 
 [dev-dependencies]
 futures = "0.3.5"
 fastrand = "1.4.0"
 tokio = { version = "0.3.5", default-features = false, features = ["rt", "macros", "rt-multi-thread", "net", "io-util", "time"] }
 etherparse = "0.9.0"
+
+[features]
+bench = []
 
 [[bench]]
 name = "executor"
@@ -77,4 +81,13 @@ harness = false
 
 [[bench]]
 name = "udp"
+harness = false
+
+[[bench]]
+name = "nop"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "sharding"
 harness = false
