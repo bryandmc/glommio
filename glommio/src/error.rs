@@ -158,13 +158,18 @@ pub enum GlommioError<T> {
     ReactorError(ReactorErrorKind),
 
     /// Error casting integers from different sizes.
-    #[error("Failed to cast integer: {0}")]
-    InvalidIntegerCast(#[from] TryFromIntError),
+    InvalidIntegerCast(TryFromIntError),
 }
 
 impl<T> From<io::Error> for GlommioError<T> {
     fn from(err: io::Error) -> Self {
         GlommioError::IoError(err)
+    }
+}
+
+impl<T> From<TryFromIntError> for GlommioError<T> {
+    fn from(err: TryFromIntError) -> Self {
+        GlommioError::InvalidIntegerCast(err)
     }
 }
 
@@ -234,6 +239,9 @@ impl<T> fmt::Display for GlommioError<T> {
             },
             GlommioError::ReactorError(err) => {
                 write!(f, "Reactor error: {}", err)
+            }
+            GlommioError::InvalidIntegerCast(err) => {
+                write!(f, "Invalid integer cast: {}", err)
             }
         }
     }

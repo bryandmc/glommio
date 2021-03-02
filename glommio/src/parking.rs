@@ -262,7 +262,8 @@ pub(crate) struct Reactor {
 impl Reactor {
     #[cfg(feature = "xdp")]
     pub(crate) fn new(notifier: Arc<SleepNotifier>, io_memory: usize, umem: ebpf::Umem) -> Reactor {
-        let sys = sys::Reactor::new(io_memory).expect("cannot initialize I/O event notification");
+        let sys = sys::Reactor::new(notifier, io_memory)
+            .expect("cannot initialize I/O event notification");
         let (preempt_ptr_head, preempt_ptr_tail) = sys.preempt_pointers();
         Reactor {
             sys,
@@ -278,7 +279,8 @@ impl Reactor {
 
     #[cfg(not(feature = "xdp"))]
     pub(crate) fn new(notifier: Arc<SleepNotifier>, io_memory: usize) -> Reactor {
-        let sys = sys::Reactor::new(io_memory).expect("cannot initialize I/O event notification");
+        let sys = sys::Reactor::new(notifier, io_memory)
+            .expect("cannot initialize I/O event notification");
 
         let (preempt_ptr_head, preempt_ptr_tail) = sys.preempt_pointers();
         Reactor {
@@ -620,11 +622,12 @@ impl Reactor {
         self.process_shared_channels(&mut wakers);
 
         if cfg!(feature = "xdp") {
-            // println!("XDP feature enabled!");
-            let mut umem = self.xdp_umem.borrow_mut();
-            // println!("BORROWED AS MUT IN RT..");
-            umem.maybe_consume_completions();
-            umem.maybe_fill_descriptors();
+            #[cfg(feature = "xdp")]
+            {
+                let mut umem = self.xdp_umem.borrow_mut();
+                umem.maybe_consume_completions();
+                umem.maybe_fill_descriptors();
+            }
         }
         // println!("FINISHED borrowed ..");
 

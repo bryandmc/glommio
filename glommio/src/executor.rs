@@ -435,17 +435,16 @@ impl LocalExecutorBuilder {
     /// let local_ex = LocalExecutorBuilder::new().make().unwrap();
     /// ```
     pub fn make(self) -> Result<LocalExecutor> {
-        #[cfg(feature = "xdp")]
         let notifier = sys::new_sleep_notifier()?;
+        #[cfg(feature = "xdp")]
         let mut le = LocalExecutor::new(
-            EXECUTOR_ID.fetch_add(1, Ordering::Relaxed),
+            notifier,
             self.io_memory,
             self.xdp_config
                 .expect("ERROR must create XDP config in executor builder before using it."),
         );
         #[cfg(not(feature = "xdp"))]
-        let mut le =
-            LocalExecutor::new(EXECUTOR_ID.fetch_add(1, Ordering::Relaxed), self.io_memory);
+        let mut le = LocalExecutor::new(notifier, self.io_memory);
         if let Some(cpu) = self.binding {
             le.bind_to_cpu(cpu)?;
             le.queues.borrow_mut().spin_before_park = self.spin_before_park;
@@ -505,10 +504,9 @@ impl LocalExecutorBuilder {
             .name(name)
             .spawn(move || {
                 #[cfg(feature = "xdp")]
-                let mut le =
-                    LocalExecutor::new(notifier, id, self.io_memory, self.xdp_config.unwrap());
+                let mut le = LocalExecutor::new(notifier, self.io_memory, self.xdp_config.unwrap());
                 #[cfg(not(feature = "xdp"))]
-                let mut le = LocalExecutor::new(notifier, id, self.io_memory);
+                let mut le = LocalExecutor::new(notifier, self.io_memory);
                 if let Some(cpu) = self.binding {
                     le.bind_to_cpu(cpu).unwrap();
                     le.queues.borrow_mut().spin_before_park = self.spin_before_park;
@@ -584,7 +582,7 @@ impl LocalExecutor {
     }
 
     #[cfg(not(feature = "xdp"))]
-    fn new(notifier: Arc<sys::SleepNotifier>, id: usize, io_memory: usize) -> LocalExecutor {
+    fn new(notifier: Arc<sys::SleepNotifier>, io_memory: usize) -> LocalExecutor {
         let p = parking::Parker::new();
         LocalExecutor {
             queues: ExecutorQueues::new(),
@@ -597,7 +595,6 @@ impl LocalExecutor {
     #[cfg(feature = "xdp")]
     fn new(
         notifier: Arc<sys::SleepNotifier>,
-        id: usize,
         io_memory: usize,
         config: XdpConfig,
     ) -> LocalExecutor {
@@ -606,8 +603,8 @@ impl LocalExecutor {
         LocalExecutor {
             queues: ExecutorQueues::new(),
             parker: p,
-            id,
-            reactor: Rc::new(parking::Reactor::new(io_memory, umem)),
+            id: notifier.id(),
+            reactor: Rc::new(parking::Reactor::new(notifier, io_memory, umem)),
         }
     }
 

@@ -10,6 +10,7 @@
 
 use std::ptr;
 
+use super::ebpf;
 use crate::sys::uring::UringBuffer;
 use alloc::alloc::Layout;
 
@@ -48,6 +49,36 @@ impl Drop for SysAlloc {
 pub(crate) enum BufferStorage {
     Sys(SysAlloc),
     Uring(UringBuffer),
+
+    #[cfg(feature = "xdp")]
+    Umem(ebpf::FrameBuf),
+}
+
+#[cfg(feature = "xdp")]
+use umem::UmemBuffer;
+
+#[cfg(feature = "xdp")]
+mod umem {
+    use super::*;
+
+    #[derive(Debug)]
+    pub(crate) struct UmemBuffer {
+        data: ptr::NonNull<u8>,
+    }
+
+    impl UmemBuffer {
+        pub(crate) fn new() -> UmemBuffer {
+            UmemBuffer {
+                data: ptr::NonNull::dangling(),
+            }
+        }
+        pub(crate) fn as_ptr(&self) -> *const u8 {
+            self.data.as_ptr() as _
+        }
+        pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.data.as_ptr() as _
+        }
+    }
 }
 
 impl BufferStorage {
@@ -55,6 +86,9 @@ impl BufferStorage {
         match self {
             BufferStorage::Sys(x) => x.as_ptr(),
             BufferStorage::Uring(x) => x.as_ptr(),
+
+            #[cfg(feature = "xdp")]
+            BufferStorage::Umem(x) => x.as_ptr(),
         }
     }
 
@@ -62,6 +96,9 @@ impl BufferStorage {
         match self {
             BufferStorage::Sys(x) => x.as_mut_ptr(),
             BufferStorage::Uring(x) => x.as_mut_ptr(),
+
+            #[cfg(feature = "xdp")]
+            BufferStorage::Umem(x) => x.as_mut_ptr(),
         }
     }
 }

@@ -61,9 +61,7 @@ impl XdpSocket {
     fn new(config: XdpConfig) -> Result<XdpSocket> {
         dbg!(&config);
         let umem = Local::get_reactor().xdp_umem.clone();
-        println!("created umem.. {:?}", umem);
         let driver = XskSocketDriver::new(config.into(), Local::get_reactor().xdp_umem.clone())?;
-        println!("created driver.. {:?}", driver);
         Ok(XdpSocket {
             driver,
             umem,
@@ -177,7 +175,7 @@ impl XdpSocket {
     pub fn get_buffer(&mut self) -> Option<FrameBuf> {
         let mut umem = self.umem.borrow_mut();
         let full_size = umem.frame_size();
-        umem.free_list.pop_front().map(|mut x| {
+        umem.free_list.pop_front().map(|x| {
             // NOTE: setting this to full size gives us access to the full frame area
             x.len.set(full_size);
             x.get_buffer(self.umem.clone())
@@ -313,9 +311,6 @@ impl XdpConfigBuilder {
 
     /// Fill size
     pub const fn fill_size(self, fill_size: u32) -> XdpConfigBuilder {
-        // dbg!(!(fill_size & (4096 - 1)));
-        // assert!();
-        // assert!(fill_size & (4096 - 1));
         if fill_size & (4096 - 1) == 0 {
             return XdpConfigBuilder { fill_size, ..self };
         }
@@ -324,13 +319,9 @@ impl XdpConfigBuilder {
 
     /// Completion size
     pub const fn completion_size(self, comp_size: u32) -> XdpConfigBuilder {
-        // dbg!(comp_size & (4096 - 1));
-        // assert!();
         if comp_size & (4096 - 1) == 0 {
             return XdpConfigBuilder { comp_size, ..self };
         }
-        // assert!(comp_size & (4096 - 1));
-
         XdpConfigBuilder { ..self }
     }
 
@@ -462,6 +453,7 @@ impl From<XdpConfig> for XskSocketConfig {
 
 #[cfg(test)]
 mod tests {
+    use futures_lite::prelude::*;
     use std::time::Duration;
 
     use super::super::sys::ebpf::tests::{run_ping_command, run_udp_traffic_command, XDP_LOCK};

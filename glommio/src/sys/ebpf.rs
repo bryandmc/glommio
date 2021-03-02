@@ -1189,8 +1189,6 @@ impl std::ops::Deref for FrameBuf {
         let inner = &self.inner;
         // println!("Before Deref for frame: {:?}", inner.frame);
         let umem = inner.umem.borrow();
-
-        // println!("After Deref for frame: {:?}", inner.frame);
         unsafe {
             slice::from_raw_parts(
                 umem.memory
@@ -1796,9 +1794,9 @@ pub(crate) mod tests {
     #[test]
     #[cfg_attr(not(feature = "xdp"), ignore)]
     fn create_huge_page_struct() {
-        let mut b = Box::new(String::new());
-        let x = b.as_mut_ptr();
-        isboxcopy(x);
+        // let mut b = Box::new(String::new());
+        // let x = b.as_mut_ptr();
+        // isboxcopy(x);
 
         let prot = PROT_READ | PROT_WRITE;
         let file = -1;
@@ -1816,6 +1814,10 @@ pub(crate) mod tests {
             )
         };
 
+        dbg!(mem_ptr);
+        if mem_ptr.is_null() {
+            panic!("NULL POINTER!");
+        }
         unsafe {
             std::ptr::write(
                 mem_ptr.cast::<HugePagesStruct>(),

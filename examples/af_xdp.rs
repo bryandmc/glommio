@@ -24,7 +24,7 @@ fn main() -> Result<(), io::Error> {
         let t = Task::local(async move {
             let mut sock_handle = inner_socket.borrow_mut();
             loop {
-                let amt = sock_handle.recv(50).await;
+                let amt = sock_handle.recv().await;
                 let bufs = amt.unwrap();
                 if bufs.is_empty() {
                     return;
@@ -36,7 +36,8 @@ fn main() -> Result<(), io::Error> {
                     let orig_src = b[6..12].to_vec();
                     b.mac_dst_mut().copy_from_slice(&orig_src);
                     b.mac_src_mut().copy_from_slice(&orig_dest);
-                    let resp = sock_handle.send(&[b]).await;
+                    let mut v = vec![b];
+                    let resp = sock_handle.send(&mut v).await;
                 }
                 Local::yield_if_needed().await;
             }

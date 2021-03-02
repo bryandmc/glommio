@@ -459,6 +459,10 @@ impl IoRequirements {
 #[cfg(test)]
 pub(crate) mod test_utils {
     use super::*;
+    // use futures::prelude::*;
+    // use futures::future::TryFutureExt;
+    use futures_lite::future::poll_once;
+    use futures_lite::prelude::*;
     use nix::sys::statfs::*;
     use std::path::{Path, PathBuf};
 
@@ -511,5 +515,43 @@ pub(crate) mod test_utils {
             TestDirectoryKind::NonPollMedia
         };
         TestDirectory { path: dir, kind }
+    }
+
+    macro_rules! race {
+        ($first:expr, $second:expr, $($rest:expr),*) => {{
+            $first.race(race!($second, $($rest),*))
+        }};
+        ($first:expr, $second:expr) => {{
+            $first.race($second)
+        }};
+    }
+
+    #[test]
+    fn futures_select_example() {
+        let local = LocalExecutorBuilder::new()
+            .pin_to_cpu(0)
+            .spin_before_park(Duration::from_secs(1))
+            .name("test")
+            .make()
+            .unwrap();
+
+        local.run(async move {
+            let a = async { 1u32 };
+            let b = async { 2u32 };
+            let c = async { 3u32 };
+            let x = b.race(a).race(c).await;
+            dbg!(x);
+
+            let a = async { 1u32 };
+            let b = async { 2u32 };
+            let c = async { 3u32 };
+            let d = async { 4u32 };
+            let e = async { 5u32 };
+            let f = async { 6u32 };
+            let g = async { 7u32 };
+
+            let x = race! { a, b, c, d, e, f, g };
+            dbg!(x.await);
+        });
     }
 }
