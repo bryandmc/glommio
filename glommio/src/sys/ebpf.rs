@@ -490,7 +490,7 @@ impl Umem {
     /// Create a new UMEM memory region
     ///
     pub fn new(num_descriptors: u32, config: xsk_umem_config) -> Result<Umem> {
-        let mut memory_region = MemoryRegion::new(PAGE_SIZE * num_descriptors, true)?;
+        let mut memory_region = MemoryRegion::new(PAGE_SIZE * num_descriptors, false)?;
         dbg!(&memory_region);
         // Unsafe because this requires us to essentially create multiple mutable aliases to the same thing,
         // which is usually frowned upon by the compiler/optimizer and could cause problems but we have

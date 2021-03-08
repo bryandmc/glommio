@@ -499,6 +499,14 @@ mod tests {
         });
     }
 
+    /// RUN IT LIKE THIS: sudo cargo test --features xdp af_xdp_socket_send -- --nocapture
+    ///
+    /// THIS TEST RUNS MOST OF THE FUNCTIONALITY!!
+    ///
+    /// It's only really able to run one of these tests at a time. Otherwise you get "device or resource busy"
+    /// because there seems to be a mapping to the process, so you can't re-initialize the af_xdp socket
+    /// again after the last test. Or it just takes too long for it to be destroyed that the next test
+    /// always fails.
     #[test]
     #[cfg_attr(not(feature = "xdp"), ignore)]
     fn af_xdp_socket_send() {
@@ -569,6 +577,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     #[cfg_attr(not(feature = "xdp"), ignore)]
     fn af_xdp_socket_recv() {
         let _guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
