@@ -15,8 +15,7 @@ AF_XDP can operate in different modes, or it can select the best possible mode b
         4. We can check a flag for all this. In high-perf drivers it shouldn't be required unless we haven't gotten packets for a long time.
     3. You now own these frames until you pass them somewhere else. It's safe to read the data from the UMEM where the descriptor points
 
-4. TX path:
-    0. You own the frames either from your stash (weren't put in fill ring), or that you got from RX
+4. TX path (You own the frames either from your stash (weren't put in fill ring), or that you got from RX):
     1. Have UMEM frame full of data you want to send
     2. Insert descriptors for frames you want to send into TX queue
         1. Sometimes requires calling "sendto" on teh descriptor with no data attached. Only X (I forget the number) can be send PER call to sendto, so batch these up in one submission to the ring.
