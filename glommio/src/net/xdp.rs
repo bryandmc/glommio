@@ -173,9 +173,10 @@ impl XdpSocket {
 
     /// Get a free buffer, so information can be copied into it.
     pub fn get_buffer(&mut self) -> Option<FrameBuf> {
-        let mut umem = self.umem.borrow_mut();
+        let umem = self.umem.borrow_mut();
         let full_size = umem.frame_size();
-        umem.free_list.pop_front().map(|x| {
+        let mut free_list = umem.free_list.borrow_mut();
+        free_list.pop_front().map(|x| {
             // NOTE: setting this to full size gives us access to the full frame area
             x.len.set(full_size);
             x.get_buffer(self.umem.clone())
@@ -184,11 +185,12 @@ impl XdpSocket {
 
     /// Get free buffers to use for creating frames to send (most likely).
     pub fn get_buffers(&mut self, amt: usize) -> Vec<FrameBuf> {
-        let mut umem = self.umem.borrow_mut();
+        let umem = self.umem.borrow_mut();
         let full_size = umem.frame_size();
-        umem.free_list
+        let mut free_list = umem.free_list.borrow_mut();
+        free_list
             .drain(..amt)
-            .map(|mut x| {
+            .map(|x| {
                 // NOTE: setting this to full size gives us access to the full frame area
                 x.len.set(full_size);
                 x.get_buffer(self.umem.clone())
@@ -533,17 +535,13 @@ mod tests {
             let mut sock = XdpSocket::bind_with_config(config).unwrap();
             dbg!(&sock);
             for _ in 0..300 {
-                // crate::timer::sleep(Duration::from_millis(10)).await;
                 let mut frames = sock.recv().await.unwrap();
-                // let buff = sock.get_buffer().unwrap();
-                // println!("BUFFER: {:?}", &buff[..]);
-                // frames.push(buff);
                 if let Some(first) = frames.get_mut(0) {
                     let src_mac = first.mac_src().to_vec();
                     let dst_mac = first.mac_dst().to_vec();
                     if let EtherType::Ipv4 = first.ether_type() {
                         let out = first.ip_header_len();
-                        let ipv = ( first[14] & 0b11110000 ) >> 4;
+                        let ipv = (first[14] & 0b11110000) >> 4;
                         println!("Got frame of ether type: {:?} ({}), header size {} \
                                   ( {:08b} ) = {}", first.ether_type(), ipv, first[14], first[14], out);
                         println!("Got frame with data -- src: {:?}, dst: {:?}", first.ip_src(), first.ip_dst());

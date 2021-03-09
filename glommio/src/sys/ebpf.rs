@@ -17,7 +17,7 @@ use std::{
     io,
     mem::ManuallyDrop,
     net::Ipv4Addr,
-    ops::{Index, IndexMut},
+    ops::{self, Index, IndexMut},
     os::unix::prelude::{IntoRawFd, RawFd},
     ptr,
     rc::{Rc, Weak},
@@ -87,6 +87,8 @@ pub struct XskSocketDriver {
     fd: RawFd,
 }
 
+pub(crate) type Arena = Vec<*const libbpf_sys::xdp_desc>;
+
 impl XskSocketDriver {
     /// # create AF_XDP socket
     ///
@@ -149,29 +151,33 @@ impl XskSocketDriver {
         }
     }
 
-    /// Consumes descriptors from the RX queue
-    pub(crate) fn consume_rx(&mut self, descriptors: &mut [FrameRef]) -> usize {
-        let nb = descriptors.len().try_into().unwrap();
-        if nb == 0 {
-            return 0;
+    /// Consumes descriptors from the RX queue, by adding them to our arena of RX frames to
+    /// process. Try to pre-allocate a space for it and just keep reusing it. Should be easy
+    /// because it only needs to hold pointers.
+    pub(crate) fn consume_rx_unsafe(
+        &mut self,
+        arena: &mut Arena,
+        batch_size: u64,
+    ) -> Option<usize> {
+        if batch_size == 0 {
+            return None;
         }
         let mut idx = 0;
         unsafe {
-            let count = libbpf_sys::_xsk_ring_cons__peek(self.rx_queue.as_mut(), nb, &mut idx);
+            let count =
+                libbpf_sys::_xsk_ring_cons__peek(self.rx_queue.as_mut(), batch_size, &mut idx);
             if count == 0 {
-                return 0;
+                return None;
             }
             let count_usize = count.try_into().unwrap();
-            for desc in descriptors.iter_mut().take(count_usize) {
+            for _ in 0..count_usize {
                 let rx_descriptor =
                     libbpf_sys::_xsk_ring_cons__rx_desc(self.rx_queue.as_ref(), idx);
-                desc.addr.set((*rx_descriptor).addr);
-                desc.len.set((*rx_descriptor).len);
-                desc.options.set((*rx_descriptor).options);
+                arena.push(rx_descriptor);
                 idx += 1;
             }
             libbpf_sys::_xsk_ring_cons__release(self.rx_queue.as_mut(), count);
-            count_usize
+            Some(count.try_into().unwrap())
         }
     }
 
@@ -355,101 +361,16 @@ impl Drop for XskSocketDriver {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct Cursor<T: Eq + PartialEq + Copy + Ord + PartialOrd> {
-    start: Cell<T>,
-    end: Cell<T>,
-    tuple: Cell<(T, T)>,
-}
+// static uint64_t xsk_alloc_umem_frame(struct xsk_socket_info *xsk)
+// {
+//    uint64_t frame;
+//    if (xsk->umem_frame_free == 0)
+//        return INVALID_UMEM_FRAME;
 
-// or ...
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct RingCursor<T: Copy + fmt::Debug> {
-    start: T,
-    end: T,
-}
-
-struct CCursor {
-    fill: Cell<(u32, u32)>,
-    rx: Cell<(u32, u32)>,
-    tx: Cell<(u32, u32)>,
-    completion: Cell<(u32, u32)>,
-}
-
-enum CursorRange {
-    Free(u32, u32, Option<Box<CursorRange>>),
-    Fill(u32, u32, Option<Box<CursorRange>>),
-    Rx(u32, u32, Option<Box<CursorRange>>),
-    Tx(u32, u32, Option<Box<CursorRange>>),
-    Completion(u32, u32, Option<Box<CursorRange>>),
-}
-
-enum ReadRingCursor {
-    Free(u32, u32, Option<Box<CursorRange>>),
-    Fill(u32, u32, Option<Box<CursorRange>>),
-    Rx(u32, u32, Option<Box<CursorRange>>),
-}
-
-enum WriteRingCursor {
-    Free(u32, u32, Option<Box<CursorRange>>),
-    Tx(u32, u32, Option<Box<CursorRange>>),
-    Completion(u32, u32, Option<Box<CursorRange>>),
-}
-
-impl CursorRange {
-    fn something() {
-        let free = CursorRange::Free(10, 100, None);
-        let fill = CursorRange::Fill(0, 10, Some(Box::new(free)));
-        fn inner(cursor: CursorRange) {
-            match cursor {
-                CursorRange::Free(free_start, free_end, Some(next)) => inner(*next),
-                CursorRange::Fill(fill_start, fill_end, Some(next)) => inner(*next),
-                CursorRange::Rx(_, _, Some(next)) => inner(*next),
-                _ => {}
-            }
-        }
-    }
-}
-
-impl CCursor {
-    fn advance_fill(&self, amt: u32) {
-        let fill = self.fill.get();
-        self.fill.set((fill.0, fill.1 + amt));
-    }
-}
-
-impl<T: Eq + PartialEq + Copy + Ord + PartialOrd> Ord for Cursor<T> {
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
-        let (start, end) = (self.start.get(), self.end.get());
-        let (other_start, other_end) = (other.start.get(), other.end.get());
-        if end < other_end && end < other_start {
-            return Ordering::Less;
-        }
-        Ordering::Equal
-    }
-}
-
-impl<T: Eq + PartialEq + Copy + Ord + PartialOrd> PartialOrd for Cursor<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        todo!()
-    }
-}
-
-trait Curse {
-    fn overlaps(&self, other: Self) -> bool;
-}
-
-impl<T: Copy + fmt::Debug> Curse for RingCursor<T> {
-    fn overlaps(&self, other: Self) -> bool {
-        todo!()
-    }
-}
-
-struct TestUse {
-    fill_ring: Cell<RingCursor<u32>>,
-    rx_ring: Cursor<u32>,
-}
+//    frame = xsk->umem_frame_addr[--xsk->umem_frame_free];
+//    xsk->umem_frame_addr[xsk->umem_frame_free] = INVALID_UMEM_FRAME;
+//    return frame;
+// }
 
 /// # UMEM memory region
 ///
@@ -475,9 +396,15 @@ pub struct Umem {
     umem: Box<xsk_umem>,
     fill_queue: Box<xsk_ring_prod>,
     completion_queue: Box<xsk_ring_cons>,
-    memory: MemoryRegion,
-    pub(crate) free_list: VecDeque<FrameRef>,
-    // free_set: HashSet<FrameRef>,
+    pub(crate) memory: RefCell<MemoryRegion>,
+
+    /// TODO: This is how they do it above
+    // frame_addrs: Box<[u64]>,
+
+    /// TODO: consider removing free list for a flat array/slice of descriptors and a
+    /// cursor that tells us the position. But this would cause flexibility issues where
+    /// we are forced to do things in order..
+    pub(crate) free_list: RefCell<VecDeque<FrameRef>>,
     pub(crate) pending_completions: VecDeque<FrameBuf>,
     frames: u32,
     frame_size: u32,
@@ -516,7 +443,6 @@ impl Umem {
         };
 
         if err != 0 {
-            println!("Returning early!");
             return Err(io::Error::last_os_error().into());
         }
         let umem_box = unsafe { Box::from_raw(umem) };
@@ -544,11 +470,11 @@ impl Umem {
                 umem: umem_box,
                 fill_queue: Box::from_raw(fq_ptr),
                 completion_queue: Box::from_raw(cq_ptr),
-                memory: memory_region,
+                memory: RefCell::new(memory_region),
                 frames: num_descriptors,
                 frame_size: PAGE_SIZE,
                 fd: fd.into_raw_fd(),
-                free_list: descriptors,
+                free_list: RefCell::new(descriptors),
 
                 // Allocated with a full capacity of 5000 because (hopefully) it won't need to grow
                 // beyond that, and so that we aren't constantly reallocating or allocating.
@@ -660,7 +586,6 @@ impl Umem {
                     };
                     {
                         let mut descriptor = &desc.inner;
-                        // println!("Computing address for {} = {}", descriptor.frame.addr, addr);
                         descriptor.frame.addr.set(addr);
                         descriptor.frame.len.set(0);
                         descriptor.frame.options.set(0);
@@ -668,13 +593,7 @@ impl Umem {
                     }
 
                     let frame = desc.inner.frame.clone();
-                    // let frame = FrameRef {
-                    //     addr: bfr.addr.get(),
-                    //     len: bfr.len.get(),
-                    //     options: bfr.options.get(),
-                    //     in_queue: bfr.in_queue,
-                    // };
-                    self.free_list.push_back(frame);
+                    self.free_list.borrow_mut().push_back(frame);
                     i += 1;
                     let x = ManuallyDrop::new(desc);
                 }
@@ -703,6 +622,9 @@ impl Umem {
         None
     }
 
+    /// Fill descriptors into the "fill" ring.
+    ///
+    ///
     pub(crate) fn fill_descriptors(&mut self, mut amt: usize) -> usize {
         log_queue_counts!(self.fill_queue, "FILL");
         println!("Going to attempt to fill {} descriptors..", amt);
@@ -719,20 +641,28 @@ impl Umem {
             }
         };
 
-        let max = std::cmp::min(self.free_list.len(), count as usize);
-        let descriptors = self.free_list.drain(..max as usize);
+        let max = std::cmp::min(self.free_list.borrow().len(), count as usize);
+        let descriptors = self.free_list.borrow_mut().drain(..max as usize);
         dbg!((idx, count, amt, descriptors.len(), max));
 
         if count == 0 {
             return 0;
         }
         for frame in descriptors {
+            // SAFETY: We are passing "ownership" of these frames by the time we submit these values.
+            // Should we just drop or get rid of (or put in an arena type thing) the descriptors? Honestly,
+            // the easiest thing might just be to drop the frame refs and then keep track of the ones we get
+            // out of the rx queue. This is basically just passing in the starting position for a chunk of
+            // umem frames.
+            //
+            // The idx is the position in the ring.
             unsafe {
                 let f = libbpf_sys::_xsk_ring_prod__fill_addr(self.fill_queue.as_mut(), idx);
                 *f = frame.addr.get()
             };
             idx += 1;
         }
+        // Actually submit "count" entries to the fill ring.
         unsafe { libbpf_sys::_xsk_ring_prod__submit(self.fill_queue.as_mut(), count) };
         count.try_into().unwrap()
     }
@@ -833,7 +763,7 @@ impl Default for UmemConfig {
 }
 
 /// FrameRef - reference to individual UMEM frames.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct FrameRef {
     /// The starting address of the frame
     pub(crate) addr: Cell<u64>,
@@ -920,11 +850,11 @@ impl MemoryRegion {
     /// and can guaranteed to be valid (non-null), but only prevents aliasing by using various queues to
     /// pass ownership to and from the kernel (and ourselves). This is still marked unsafe because it is
     /// not safe to just blindly pass, keep, mutate multiple pointers that are created by this function.
-    unsafe fn as_mut_ptr(&mut self) -> *mut libc::c_void {
+    pub(crate) unsafe fn as_mut_ptr(&mut self) -> *mut libc::c_void {
         self.mem_ptr.as_ptr() as _
     }
 
-    unsafe fn as_ptr(&self) -> *const libc::c_void {
+    pub(crate) unsafe fn as_ptr(&self) -> *const libc::c_void {
         self.mem_ptr.as_ptr() as _
     }
 }
@@ -947,6 +877,107 @@ where
     fn index_mut(&mut self, index: T) -> &mut Self::Output {
         unsafe {
             slice::from_raw_parts_mut(self.mem_ptr.as_ptr(), self.len as usize).index_mut(index)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Inner {
+    umem: ptr::NonNull<Umem>,
+    // frame: *const libbpf_sys::xdp_desc,
+    frame: FrameRef,
+    refcount: Cell<u16>,
+}
+
+#[derive(Debug)]
+pub struct Buf {
+    inner: ptr::NonNull<Inner>,
+}
+
+impl Buf {
+    unsafe fn new<F>(umem: ptr::NonNull<Umem>, frame: F) -> Buf
+    where
+        F: Into<Option<FrameRef>>,
+    {
+        let f: Option<_> = frame.into();
+        let frame = f.unwrap_or(FrameRef {
+            addr: 0.into(),
+            len: 0.into(),
+            options: 0.into(),
+            in_queue: false,
+        });
+        let inner = Box::new(Inner {
+            umem,
+            frame,
+            refcount: Cell::new(1),
+        });
+        Buf {
+            inner: ptr::NonNull::new_unchecked(Box::into_raw(inner)),
+        }
+    }
+
+    unsafe fn memory_region(&self) -> &MemoryRegion {
+        &self.inner.as_ref().umem.as_ref().memory.borrow()
+    }
+
+    unsafe fn memory_region_mut(&mut self) -> &mut MemoryRegion {
+        &mut self.inner.as_mut().umem.as_mut().memory.borrow_mut()
+    }
+}
+
+impl ops::Deref for Buf {
+    type Target = MemoryRegion;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.memory_region() }
+    }
+}
+
+impl ops::DerefMut for Buf {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        assert!(unsafe { self.inner.as_ref().refcount.get() } <= 1);
+        unsafe { self.memory_region_mut() }
+    }
+}
+
+impl Clone for Buf {
+    fn clone(&self) -> Self {
+        unsafe {
+            (*self.inner.as_ptr())
+                .refcount
+                .set((*self.inner.as_ptr()).refcount.get() + 1)
+        };
+        Buf { inner: self.inner }
+    }
+}
+
+impl Drop for Buf {
+    fn drop(&mut self) {
+        unsafe {
+            self.inner
+                .as_ref()
+                .refcount
+                .set(self.inner.as_ref().refcount.get() - 1);
+            println!(
+                "Decremented refcount to: {}",
+                self.inner.as_ref().refcount.get()
+            );
+
+            if self.inner.as_ref().refcount.get() == 0 {
+                let frame = self.inner.as_ref().frame.clone();
+                println!("Actually dropping: {:#?}", self.inner.as_ref());
+                self.inner
+                    .as_mut()
+                    .umem
+                    .as_mut()
+                    .free_list
+                    .borrow_mut()
+                    .push_back(frame);
+                println!(
+                    "Free list len: {}",
+                    self.inner.as_mut().umem.as_mut().free_list.borrow().len()
+                );
+            }
         }
     }
 }
@@ -1182,7 +1213,7 @@ pub(crate) struct InnerBuf {
     pub(crate) frame: FrameRef,
 }
 
-impl std::ops::Deref for FrameBuf {
+impl ops::Deref for FrameBuf {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -1201,7 +1232,7 @@ impl std::ops::Deref for FrameBuf {
     }
 }
 
-impl std::ops::DerefMut for FrameBuf {
+impl ops::DerefMut for FrameBuf {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // TODO: We may have to eventually remove the refcell wrapper because it could
         // be too easy to trip on, when we know it's actually probably safe to just give
@@ -1213,6 +1244,7 @@ impl std::ops::DerefMut for FrameBuf {
         let res = unsafe {
             slice::from_raw_parts_mut(
                 umem.memory
+                    .borrow_mut()
                     .as_mut_ptr()
                     .offset(inner.frame.addr.get() as isize)
                     .cast::<u8>(),
@@ -1231,7 +1263,12 @@ impl Drop for FrameBuf {
     fn drop(&mut self) {
         let copied = self.inner.frame.clone();
         println!("Dropping FrameBuf: {:?}", copied);
-        self.inner.umem.borrow_mut().free_list.push_back(copied);
+        self.inner
+            .umem
+            .borrow_mut()
+            .free_list
+            .borrow_mut()
+            .push_back(copied);
     }
 }
 
@@ -1391,6 +1428,54 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn buf_test() {
+        unsafe {
+            let umem = Box::new(Umem::new(10, UmemConfig::default().into()).unwrap());
+            let umem_ptr = ptr::NonNull::new_unchecked(Box::into_raw(umem));
+            let b = Buf {
+                inner: ptr::NonNull::new_unchecked(&mut Inner {
+                    umem: umem_ptr,
+                    frame: FrameRef {
+                        addr: 0.into(),
+                        len: 0.into(),
+                        options: 0.into(),
+                        in_queue: false,
+                    },
+                    refcount: Cell::new(1),
+                }),
+            };
+
+            dbg!(&b, b.inner.as_ref());
+            let bb = Buf::new(umem_ptr, None);
+            let bbb = Buf::new(
+                umem_ptr,
+                FrameRef {
+                    addr: Cell::new(2),
+                    len: Cell::new(1500),
+                    options: Cell::new(0),
+                    in_queue: true,
+                },
+            );
+            let mut bbbb = bbb.clone();
+            dbg!(
+                (&bb, bb.inner.as_ref()),
+                (&bbb, bbb.inner.as_ref()),
+                (&bbbb, bbbb.inner.as_ref())
+            );
+
+            let slice = &bbbb.memory_region()[..10];
+            dbg!(slice);
+
+            drop(bbb);
+            let slice_again = &bbbb[..10];
+            dbg!(slice_again);
+            &mut bbbb[..10].copy_from_slice(b"0123456789");
+            let mutable_slice = &bbbb[..10];
+            dbg!(mutable_slice);
+        }
+    }
+
+    #[test]
     fn frame_buf_drop_requeue() {
         let umem = Rc::new(RefCell::new(
             Umem::new(10, UmemConfig::default().into()).unwrap(),
@@ -1444,12 +1529,12 @@ pub(crate) mod tests {
         dbg!(
             &umem,
             &umem.borrow().free_list,
-            &umem.borrow().free_list.len(),
+            &umem.borrow().free_list.borrow().len(),
         );
         let qty = umem.borrow_mut().fill_descriptors(5);
         assert_eq!(qty, 5);
         dbg!(&umem.borrow().free_list);
-        assert_eq!(umem.borrow().free_list.len(), 5);
+        assert_eq!(umem.borrow().free_list.borrow().len(), 5);
         dbg!(
             umem.borrow().fill_queue.cached_prod,
             unsafe { *umem.borrow().fill_queue.producer },
@@ -1618,11 +1703,19 @@ pub(crate) mod tests {
 
             let queue_len = in_queue.len();
             for frame in in_queue {
-                socket.umem.borrow_mut().free_list.push_back(frame);
+                socket
+                    .umem
+                    .borrow_mut()
+                    .free_list
+                    .borrow_mut()
+                    .push_back(frame);
             }
-            println!("Free list len: {}", socket.umem.borrow().free_list.len());
+            println!(
+                "Free list len: {}",
+                socket.umem.borrow().free_list.borrow().len()
+            );
             let fill_count = socket.umem.borrow_mut().fill_count();
-            let free_list_len = socket.umem.borrow().free_list.len();
+            let free_list_len = socket.umem.borrow().free_list.borrow().len();
             let total = fill_count + free_list_len - queue_len;
             dbg!(
                 fill_count,
@@ -1788,8 +1881,6 @@ pub(crate) mod tests {
         b: String,
         c: SomeADT,
     }
-
-    fn isboxcopy<T: Copy>(item: T) {}
 
     #[test]
     #[cfg_attr(not(feature = "xdp"), ignore)]
