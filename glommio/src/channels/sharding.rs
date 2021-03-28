@@ -1,12 +1,19 @@
-use std::fmt::{self, Debug, Formatter};
-use std::pin::Pin;
-use std::rc::Rc;
+use std::{
+    fmt::{self, Debug, Formatter},
+    pin::Pin,
+    rc::Rc,
+};
 
 use futures_lite::{Future, Stream, StreamExt};
 
-use crate::channels::channel_mesh::{FullMesh, Senders};
-use crate::task::JoinHandle;
-use crate::{GlommioError, Local, ResourceType, Result};
+use crate::{
+    channels::channel_mesh::{FullMesh, Senders},
+    task::JoinHandle,
+    GlommioError,
+    Local,
+    ResourceType,
+    Result,
+};
 
 /// Alias for return type of `Handler`
 pub type HandlerResult = Pin<Box<dyn Future<Output = ()>>>;
@@ -78,11 +85,13 @@ impl<T: Send + Copy + 'static, H: Handler<T> + 'static> Sharded<T, H> {
         self.shard.shard_id
     }
 
-    /// Consume messages from a stream. It will return a [`GlommioError::Closed`] if this
-    /// [`Sharded`] is closed. Otherwise, the function will return immediately after spawning a
-    /// background task draining messages from the stream.
+    /// Consume messages from a stream. It will return a
+    /// [`GlommioError::Closed`] if this [`Sharded`] is closed. Otherwise,
+    /// the function will return immediately after spawning a background
+    /// task draining messages from the stream.
     ///
-    /// [`GlommioError::Closed`]: ../../error/enum.GlommioError.html#variant.Closed
+    /// [`GlommioError::Closed`]:
+    /// ../../error/enum.GlommioError.html#variant.Closed
     pub fn handle<S: Stream<Item = T> + Unpin + 'static>(&mut self, messages: S) -> Result<(), S> {
         if self.closed {
             Err(GlommioError::Closed(ResourceType::Channel(messages)))
@@ -94,9 +103,10 @@ impl<T: Send + Copy + 'static, H: Handler<T> + 'static> Sharded<T, H> {
         }
     }
 
-    /// Close this [`Sharded`] and wait for all existing background tasks to finish. No more
-    /// consuming task will be spawned, but incoming messages from the streams consumed by existing
-    /// back ground tasks will not be rejected. So it would be important to truncate the streams
+    /// Close this [`Sharded`] and wait for all existing background tasks to
+    /// finish. No more consuming task will be spawned, but incoming
+    /// messages from the streams consumed by existing back ground tasks
+    /// will not be rejected. So it would be important to truncate the streams
     /// from upstream before calling this method to prevent it from hanging.
     pub async fn close(&mut self) {
         while let Some(consumer) = self.consumers.pop() {
@@ -138,14 +148,16 @@ impl<T: Send + Copy + 'static, H: Handler<T> + 'static> Shard<T, H> {
 
 #[cfg(test)]
 mod tests {
-    use futures_lite::future::ready;
-    use futures_lite::stream::repeat_with;
-    use futures_lite::{FutureExt, StreamExt};
+    use futures_lite::{future::ready, stream::repeat_with, FutureExt, StreamExt};
 
-    use crate::channels::channel_mesh::MeshBuilder;
-    use crate::channels::sharding::{Handler, HandlerResult, Sharded};
-    use crate::enclose;
-    use crate::prelude::*;
+    use crate::{
+        channels::{
+            channel_mesh::MeshBuilder,
+            sharding::{Handler, HandlerResult, Sharded},
+        },
+        enclose,
+        prelude::*,
+    };
 
     #[test]
     fn test() {

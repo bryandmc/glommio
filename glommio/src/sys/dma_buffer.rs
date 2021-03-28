@@ -1,5 +1,5 @@
-// Unless explicitly stated otherwise all files in this repository are licensed under the
-// MIT/Apache-2.0 License, at your convenience
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the MIT/Apache-2.0 License, at your convenience
 //
 // This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //
@@ -79,11 +79,12 @@ impl BufferStorage {
 #[derive(Debug)]
 /// A buffer suitable for Direct I/O over io_uring
 ///
-/// Direct I/O has strict requirements about alignment. On top of that, io_uring places additional
-/// restrictions on memory placement if we are to use advanced features like registered buffers.
+/// Direct I/O has strict requirements about alignment. On top of that, io_uring
+/// places additional restrictions on memory placement if we are to use advanced
+/// features like registered buffers.
 ///
-/// The `DmaBuffer` is a buffer that adheres to those properties making it suitable for io_uring's
-/// Direct I/O.
+/// The `DmaBuffer` is a buffer that adheres to those properties making it
+/// suitable for io_uring's Direct I/O.
 pub struct DmaBuffer {
     storage: BufferStorage,
     // Invariant: trim + size are at most one byte past the original allocation.
@@ -126,36 +127,38 @@ impl DmaBuffer {
         self.size -= trim;
     }
 
-    /// Returns a representation of the current addressable contents of this `DmaBuffer` as a byte
-    /// slice
+    /// Returns a representation of the current addressable contents of this
+    /// `DmaBuffer` as a byte slice
     pub fn as_bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.as_ptr(), self.size) }
     }
 
-    /// Returns a representation of the current addressable contents of this `DmaBuffer` as a
-    /// mutable byte slice
+    /// Returns a representation of the current addressable contents of this
+    /// `DmaBuffer` as a mutable byte slice
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr(), self.size) }
     }
 
-    /// Returns the current number of bytes present in the addressable contents of this `DmaBuffer`
+    /// Returns the current number of bytes present in the addressable contents
+    /// of this `DmaBuffer`
     pub fn len(&self) -> usize {
         self.size
     }
 
-    /// Indicates whether or not this buffer is empty. An empty buffer can be, for instance, the
-    /// result of a read past the end of a file.
+    /// Indicates whether or not this buffer is empty. An empty buffer can be,
+    /// for instance, the result of a read past the end of a file.
     pub fn is_empty(&self) -> bool {
         self.size == 0
     }
 
-    /// Returns a representation of the current addressable contents of this `DmaBuffer` as mutable
-    /// pointer
+    /// Returns a representation of the current addressable contents of this
+    /// `DmaBuffer` as mutable pointer
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         unsafe { self.storage.as_mut_ptr().add(self.trim) }
     }
 
-    /// Returns a representation of the current addressable contents of this `DmaBuffer` as pointer
+    /// Returns a representation of the current addressable contents of this
+    /// `DmaBuffer` as pointer
     pub fn as_ptr(&self) -> *const u8 {
         unsafe { self.storage.as_ptr().add(self.trim) }
     }
@@ -180,8 +183,7 @@ use umem::UmemBuffer;
 
 #[cfg(feature = "xdp")]
 mod umem {
-    use std::{borrow::BorrowMut, cell::RefCell, convert::TryInto};
-    use std::{collections::VecDeque, rc::Rc};
+    use std::{borrow::BorrowMut, cell::RefCell, collections::VecDeque, convert::TryInto, rc::Rc};
 
     use super::*;
 
@@ -214,6 +216,7 @@ mod umem {
         pub(crate) umem: Rc<ebpf::Umem>,
     }
 
+    /// TODO: unfinished
     impl UmemAllocator {
         pub(crate) fn alloc(alloc: Rc<UmemAllocator>) -> Option<UmemBuffer> {
             let frame = match alloc.free.borrow_mut().pop_front() {
@@ -222,14 +225,9 @@ mod umem {
                     return None;
                 }
             };
-            let data = unsafe {
-                let ptr = (*alloc.umem).borrow_mut().memory.borrow_mut().as_mut_ptr();
-                let p = ptr
-                    .offset(frame.addr.get().try_into().unwrap())
-                    .cast::<u8>();
-                ptr::NonNull::new_unchecked(p)
-            };
-            Some(UmemBuffer::new(data, frame.len.get(), alloc))
+            None
         }
     }
 }
+
+// something

@@ -1,14 +1,15 @@
-// Unless explicitly stated otherwise all files in this repository are licensed under the
-// MIT/Apache-2.0 License, at your convenience
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the MIT/Apache-2.0 License, at your convenience
 //
 // This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //
 use std::{
     fmt::{self, Debug},
     io,
+    num::TryFromIntError,
+    os::unix::io::RawFd,
+    path::{Path, PathBuf},
 };
-use std::{num::TryFromIntError, path::PathBuf};
-use std::{os::unix::io::RawFd, path::Path};
 
 /// Result type alias that all Glommio public API functions can use.
 pub type Result<T, V> = std::result::Result<T, GlommioError<V>>;
@@ -18,7 +19,8 @@ pub type Result<T, V> = std::result::Result<T, GlommioError<V>>;
 #[derive(Debug)]
 pub enum ResourceType<T> {
     /// Semaphore resource that includes the requested and available shares
-    /// as debugging metadata for the [`Semaphore`](crate::sync::Semaphore) type.
+    /// as debugging metadata for the [`Semaphore`](crate::sync::Semaphore)
+    /// type.
     Semaphore {
         /// Requested shares
         requested: u64,
@@ -26,15 +28,18 @@ pub enum ResourceType<T> {
         available: u64,
     },
 
-    /// Lock variant for reporting errors from the [`RwLock`](crate::sync::RwLock) type.
+    /// Lock variant for reporting errors from the
+    /// [`RwLock`](crate::sync::RwLock) type.
     RwLock,
 
-    /// Channel variant for reporting errors from [`local_channel`](crate::channels::local_channel) and
+    /// Channel variant for reporting errors from
+    /// [`local_channel`](crate::channels::local_channel) and
     /// [`shared_channel`](crate::channels::shared_channel) channel types.
     Channel(T),
 
-    /// File variant used for reporting errors for the Buffered ([`BufferedFile`](crate::io::BufferedFile))
-    /// and Direct ([`DmaFile`](crate::io::DmaFile)) file I/O variants.
+    /// File variant used for reporting errors for the Buffered
+    /// ([`BufferedFile`](crate::io::BufferedFile)) and Direct
+    /// ([`DmaFile`](crate::io::DmaFile)) file I/O variants.
     File(String),
 }
 
@@ -53,8 +58,8 @@ pub enum ReactorErrorKind {
     /// Incorrect source type
     IncorrectSourceType,
 
-    /// Reactor dropped/not found. This can happen if you attempt to upgrade the reference-counted reactor
-    /// and it isn't still there.
+    /// Reactor dropped/not found. This can happen if you attempt to upgrade the
+    /// reference-counted reactor and it isn't still there.
     ReactorNotFound,
 }
 
@@ -97,12 +102,13 @@ impl fmt::Display for ExecutorErrorKind {
 /// Composite error type to encompass all error types glommio produces.
 ///
 /// Single error type that will be produced by any public Glommio API
-/// functions. Contains a generic type that is only used for the [ `Channel` ](ResourceType::Channel)
-/// variants. In other cases it can just be replaced with the unit type `()`
-/// and ignored. The variants are broken up into a few common categories such as
-/// [`Closed`](GlommioError::Closed) and [`WouldBlock`](GlommioError::WouldBlock)
-/// as well as a generic [`IoError`](GlommioError::IoError) and errors dedicated to
-/// the executor and reactor.
+/// functions. Contains a generic type that is only used for the [ `Channel`
+/// ](ResourceType::Channel) variants. In other cases it can just be replaced
+/// with the unit type `()` and ignored. The variants are broken up into a few
+/// common categories such as [`Closed`](GlommioError::Closed) and
+/// [`WouldBlock`](GlommioError::WouldBlock) as well as a generic
+/// [`IoError`](GlommioError::IoError) and errors dedicated to the executor and
+/// reactor.
 ///
 /// # Examples
 ///
@@ -110,10 +116,11 @@ impl fmt::Display for ExecutorErrorKind {
 /// use glommio::{GlommioError, ResourceType};
 ///
 /// fn will_error() -> Result<(), GlommioError<()>> {
-///     Err(GlommioError::WouldBlock(ResourceType::File("Error reading a file".to_string())))?
+///     Err(GlommioError::WouldBlock(ResourceType::File(
+///         "Error reading a file".to_string(),
+///     )))?
 /// }
 /// assert!(will_error().is_err());
-///
 /// ```
 pub enum GlommioError<T> {
     /// IO error from standard library functions or libraries that produce
@@ -300,9 +307,9 @@ impl fmt::Display for QueueErrorKind {
     }
 }
 
-/// Note this is a tricky impl in the sense that you will not get the information
-/// you expect from just using this display impl on a value. On the other hand the
-/// display impl for the entire error will give correct results..
+/// Note this is a tricky impl in the sense that you will not get the
+/// information you expect from just using this display impl on a value. On the
+/// other hand the display impl for the entire error will give correct results..
 impl<T> fmt::Display for ResourceType<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let fmt_str = match self {
@@ -426,7 +433,8 @@ mod test {
 
     #[test]
     #[should_panic(
-        expected = "File operation would block (\"Reading 100 bytes from position 90 would cross a buffer boundary (Buffer size 120)\")"
+        expected = "File operation would block (\"Reading 100 bytes from position 90 would cross \
+                    a buffer boundary (Buffer size 120)\")"
     )]
     fn extended_file_err_msg_unwrap() {
         let _: () = Err(GlommioError::<()>::WouldBlock(ResourceType::File(format!(
@@ -438,7 +446,8 @@ mod test {
 
     #[test]
     #[should_panic(
-        expected = "File operation would block (Reading 100 bytes from position 90 would cross a buffer boundary (Buffer size 120))"
+        expected = "File operation would block (Reading 100 bytes from position 90 would cross a \
+                    buffer boundary (Buffer size 120))"
     )]
     fn extended_file_err_msg() {
         let err: Result<(), ()> = Err(GlommioError::<()>::WouldBlock(ResourceType::File(format!(

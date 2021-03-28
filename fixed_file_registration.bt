@@ -1,0 +1,18 @@
+tracepoint:syscalls:sys_enter_io_uring_register
+{
+  printf("[%s(%d)] ring %p, opcode %d, nr_args %d\n", comm, pid, args->arg, args->opcode, args->nr_args);
+}
+/* tracepoint:io_uring:io_uring_create
+tracepoint:io_uring:io_uring_register
+tracepoint:io_uring:io_uring_file_get
+tracepoint:io_uring:io_uring_queue_async_work
+tracepoint:io_uring:io_uring_defer
+tracepoint:io_uring:io_uring_link
+tracepoint:io_uring:io_uring_cqring_wait
+tracepoint:io_uring:io_uring_fail_link
+tracepoint:io_uring:io_uring_complete
+tracepoint:io_uring:io_uring_submit_sqe
+tracepoint:io_uring:io_uring_poll_arm
+tracepoint:io_uring:io_uring_poll_wake
+tracepoint:io_uring:io_uring_task_add
+tracepoint:io_uring:io_uring_task_run */

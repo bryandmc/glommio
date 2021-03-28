@@ -1,9 +1,8 @@
 //!
 //! eBpf low level utilities and integration.
 //!
-//! Primarily uses libbpf (via libbpf_sys crate) to build AF_XDP support into Glommio.
-//!
-//!
+//! Primarily uses libbpf (via libbpf_sys crate) to build AF_XDP support into
+//! Glommio.
 
 use bitflags::bitflags;
 use core::{fmt, slice};
@@ -25,9 +24,18 @@ use std::{
 };
 
 use libbpf_sys::{
-    xsk_ring_cons, xsk_ring_prod, xsk_socket, xsk_socket_config, xsk_umem, xsk_umem_config,
-    XDP_FLAGS_UPDATE_IF_NOEXIST, XDP_USE_NEED_WAKEUP, XSK_RING_CONS__DEFAULT_NUM_DESCS,
-    XSK_RING_PROD__DEFAULT_NUM_DESCS, XSK_UMEM__DEFAULT_FLAGS, XSK_UMEM__DEFAULT_FRAME_HEADROOM,
+    xsk_ring_cons,
+    xsk_ring_prod,
+    xsk_socket,
+    xsk_socket_config,
+    xsk_umem,
+    xsk_umem_config,
+    XDP_FLAGS_UPDATE_IF_NOEXIST,
+    XDP_USE_NEED_WAKEUP,
+    XSK_RING_CONS__DEFAULT_NUM_DESCS,
+    XSK_RING_PROD__DEFAULT_NUM_DESCS,
+    XSK_UMEM__DEFAULT_FLAGS,
+    XSK_UMEM__DEFAULT_FRAME_HEADROOM,
     XSK_UMEM__DEFAULT_FRAME_SIZE,
 };
 
@@ -37,7 +45,6 @@ use super::Source;
 
 type Result<T> = std::result::Result<T, GlommioError<()>>;
 
-/// TODO: make this all adjustable / derive-able / whatever
 const PAGE_SIZE: u32 = 4096;
 
 bitflags! {
@@ -61,21 +68,14 @@ bitflags! {
 
 /// # AF_XDP socket
 ///
-/// AF_XDP socket for delivering layer 2 frames directly to userspace from very early in
-/// the kernel networking stack. So early, it's basically in the drivers code directly
-/// and can even operate in a `zero-copy` fashion.
+/// AF_XDP socket for delivering layer 2 frames directly to userspace from very
+/// early in the kernel networking stack. So early, it's basically in the
+/// drivers code directly and can even operate in a `zero-copy` fashion.
 ///
-/// It operates very differently from a standard socket type. In fact it works a lot more like
-/// memory-mapped AF_PACKET capture in that it invovles sharing memory between userspace and the
-/// kernel. It does this by passing descriptors back and forth between kernel and userspace over
-/// ring-buffers.
-///
-///
-/// # Examples
-///
-/// ```
-///
-/// ```
+/// It operates very differently from a standard socket type. In fact it works a
+/// lot more like memory-mapped AF_PACKET capture in that it invovles sharing
+/// memory between userspace and the kernel. It does this by passing descriptors
+/// back and forth between kernel and userspace over ring-buffers.
 #[derive(Debug)]
 pub struct XskSocketDriver {
     socket: Box<xsk_socket>,
@@ -90,17 +90,6 @@ pub struct XskSocketDriver {
 pub(crate) type Arena = Vec<*const libbpf_sys::xdp_desc>;
 
 impl XskSocketDriver {
-    /// # create AF_XDP socket
-    ///
-    /// Delivers L2 frames directly to userspace, depending on settings, directly from the NIC
-    /// driver hook. Other times (non-zero-copy mode) by copying it to userspace. This is less
-    /// efficient but more widely compatible and works even using the `generic` XDP. This happens
-    /// after the allocation of the `skbuff` but uses a common interface, and functions as a good
-    /// fallback, that is still generally faster than other methods that are available.
-    ///
-    /// TODO: Should we just embed the umem in this and pass it config through here?
-    /// .... It's notably less flexible, and would be a little strange but might be worth doing.
-    ///
     pub(crate) fn new(config: XskSocketConfig, umem: Rc<RefCell<Umem>>) -> Result<XskSocketDriver> {
         let cfg = xsk_socket_config {
             rx_size: config.rx_size,
@@ -151,9 +140,6 @@ impl XskSocketDriver {
         }
     }
 
-    /// Consumes descriptors from the RX queue, by adding them to our arena of RX frames to
-    /// process. Try to pre-allocate a space for it and just keep reusing it. Should be easy
-    /// because it only needs to hold pointers.
     pub(crate) fn consume_rx_unsafe(
         &mut self,
         arena: &mut Arena,
@@ -181,7 +167,6 @@ impl XskSocketDriver {
         }
     }
 
-    /// Consumes descriptors from the RX queue
     pub(crate) fn consume_rx_owned(&mut self, batch: u64) -> Vec<FrameRef> {
         log_queue_counts!(self.rx_queue, "RX");
         let mut idx = 0;
@@ -210,7 +195,6 @@ impl XskSocketDriver {
         recv_descriptors
     }
 
-    /// Adds descriptors to the TX queue
     pub(crate) fn produce_tx(&mut self, descriptors: &mut [FrameRef]) -> usize {
         let nb = descriptors.len().try_into().unwrap();
         if nb == 0 {
@@ -273,7 +257,8 @@ impl XskSocketDriver {
                 }
                 break inner_count;
             };
-            // let count = libbpf_sys::_xsk_ring_prod__reserve(self.tx_queue.as_mut(), nb, &mut idx);
+            // let count = libbpf_sys::_xsk_ring_prod__reserve(self.tx_queue.as_mut(), nb,
+            // &mut idx);
             println!("Have room for {} entries in the TX queue", count);
             if count == 0 {
                 return (0, None);
@@ -361,49 +346,12 @@ impl Drop for XskSocketDriver {
     }
 }
 
-// static uint64_t xsk_alloc_umem_frame(struct xsk_socket_info *xsk)
-// {
-//    uint64_t frame;
-//    if (xsk->umem_frame_free == 0)
-//        return INVALID_UMEM_FRAME;
-
-//    frame = xsk->umem_frame_addr[--xsk->umem_frame_free];
-//    xsk->umem_frame_addr[xsk->umem_frame_free] = INVALID_UMEM_FRAME;
-//    return frame;
-// }
-
-/// # UMEM memory region
-///
-/// UMEM memory for use with AF_XDP socket. Creating this pre-allocated region of memory is required
-/// to use AF_XDP. This will be the only pool of memory frames will be written to and shared between
-/// the kernel and userspace. This is done by passing ownership back and forth using various queue's.
-///
-/// The main ingredients to this are:
-///   - The actual mmap'd memory region
-///   - The `Fill` queue which is used for passing memory to the kernel for receiving frames
-///   - The `Completion` queue which is used for regaining memory from the kernel after transmitting
-///     packets.
-///
-/// *Note*: The actual sending and receiving is signalled using the Tx and Rx queues which live with
-/// the actual socket structure.
-///
-/// # Examples
-///
-/// ```
-///
-/// ```
 pub struct Umem {
     umem: Box<xsk_umem>,
     fill_queue: Box<xsk_ring_prod>,
     completion_queue: Box<xsk_ring_cons>,
     pub(crate) memory: RefCell<MemoryRegion>,
 
-    /// TODO: This is how they do it above
-    // frame_addrs: Box<[u64]>,
-
-    /// TODO: consider removing free list for a flat array/slice of descriptors and a
-    /// cursor that tells us the position. But this would cause flexibility issues where
-    /// we are forced to do things in order..
     pub(crate) free_list: RefCell<VecDeque<FrameRef>>,
     pub(crate) pending_completions: VecDeque<FrameBuf>,
     frames: u32,
@@ -414,18 +362,14 @@ pub struct Umem {
 }
 
 impl Umem {
-    /// Create a new UMEM memory region
-    ///
     pub fn new(num_descriptors: u32, config: xsk_umem_config) -> Result<Umem> {
         let mut memory_region = MemoryRegion::new(PAGE_SIZE * num_descriptors, false)?;
         dbg!(&memory_region);
-        // Unsafe because this requires us to essentially create multiple mutable aliases to the same thing,
-        // which is usually frowned upon by the compiler/optimizer and could cause problems but we have
-        // no other choice when the 2nd mutable alias is the kernel and we are required to keep access
-        // to the memory for our own use. The invariants are kept solely by use of the 4 queues.
+
         let mem_ptr = unsafe { memory_region.as_mut_ptr() };
 
-        // Create empty producer and consume structures for the fill and completion queues.
+        // Create empty producer and consume structures for the fill and completion
+        // queues.
         let fq: Box<xsk_ring_prod> = Default::default();
         let cq: Box<xsk_ring_cons> = Default::default();
 
@@ -497,13 +441,6 @@ impl Umem {
         self.frame_size
     }
 
-    /// Get mutable pointer to inner `xsk_umem` struct.
-    ///
-    /// # Safety
-    ///
-    /// This method is used only for getting a mutable pointer to the inner `xsk_uem`
-    /// struct which is used for creating an xdp socket. It should not be used for other
-    /// reasons.
     unsafe fn inner_umem_mut_ptr(&mut self) -> *mut xsk_umem {
         self.umem.as_mut()
     }
@@ -622,9 +559,6 @@ impl Umem {
         None
     }
 
-    /// Fill descriptors into the "fill" ring.
-    ///
-    ///
     pub(crate) fn fill_descriptors(&mut self, mut amt: usize) -> usize {
         log_queue_counts!(self.fill_queue, "FILL");
         println!("Going to attempt to fill {} descriptors..", amt);
@@ -642,20 +576,14 @@ impl Umem {
         };
 
         let max = std::cmp::min(self.free_list.borrow().len(), count as usize);
-        let descriptors = self.free_list.borrow_mut().drain(..max as usize);
+        let mut d = self.free_list.borrow_mut();
+        let descriptors = d.drain(..max as usize);
         dbg!((idx, count, amt, descriptors.len(), max));
 
         if count == 0 {
             return 0;
         }
         for frame in descriptors {
-            // SAFETY: We are passing "ownership" of these frames by the time we submit these values.
-            // Should we just drop or get rid of (or put in an arena type thing) the descriptors? Honestly,
-            // the easiest thing might just be to drop the frame refs and then keep track of the ones we get
-            // out of the rx queue. This is basically just passing in the starting position for a chunk of
-            // umem frames.
-            //
-            // The idx is the position in the ring.
             unsafe {
                 let f = libbpf_sys::_xsk_ring_prod__fill_addr(self.fill_queue.as_mut(), idx);
                 *f = frame.addr.get()
@@ -714,27 +642,12 @@ impl fmt::Debug for Umem {
     }
 }
 
-/// UMEM configuration
-///
-/// Used for configuring a UMEM instance with various parameters and settings.
 #[derive(Debug, Clone, Copy)]
 pub struct UmemConfig {
-    /// Fill ring size for the UMEM. Defaults to 2048.
     pub fill_size: u32,
-
-    /// The Completion ring size for the UMEM. Defaults to 2048.
     pub comp_size: u32,
-
-    /// The default frame size, usually equal to a page (usually 4096 bytes)
     pub frame_size: u32,
-
-    /// Headroom to the frame. Defaults to 0. Keep in mind it actually seems to
-    /// give 256 bytes of headroom, even when set to 0 and adds whatever you set
-    /// here to that 256.. That headroom is actually useful for adding encapsulation
-    /// headers to the frame without having to re-allocate / re-write the frame.
     pub frame_headroom: u32,
-
-    /// Flags for the UMEM. Defaults to 0.
     pub flags: u32,
 }
 
@@ -762,21 +675,15 @@ impl Default for UmemConfig {
     }
 }
 
-/// FrameRef - reference to individual UMEM frames.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct FrameRef {
-    /// The starting address of the frame
     pub(crate) addr: Cell<u64>,
-    /// The length of the frame inside the UMEM region
     pub(crate) len: Cell<u32>,
-    /// Options for the frame
     pub(crate) options: Cell<u32>,
-
     pub(crate) in_queue: bool,
 }
 
 impl FrameRef {
-    /// Get the underlying FrameBuf for this FrameRef
     pub fn get_buffer(self, umem: Rc<RefCell<Umem>>) -> FrameBuf {
         FrameBuf {
             inner: Rc::new(InnerBuf { umem, frame: self }),
@@ -784,8 +691,6 @@ impl FrameRef {
     }
 }
 
-/// Memory-mapped region of memory
-///
 #[derive(Debug)]
 pub struct MemoryRegion {
     len: u32,
@@ -830,8 +735,9 @@ impl MemoryRegion {
         if mem_ptr == MAP_FAILED {
             Err(io::Error::last_os_error().into())
         } else {
-            // We wanna make sure we have a good pointer here so we don't have to worry about it again
-            // later, and it helps with optimizations, supposedly.
+            // We wanna make sure we have a good pointer here so we don't have to worry
+            // about it again later, and it helps with optimizations,
+            // supposedly.
             if let Some(mem_ptr) = ptr::NonNull::new(mem_ptr.cast::<u8>()) {
                 return Ok(MemoryRegion {
                     len: bytes,
@@ -842,14 +748,6 @@ impl MemoryRegion {
         }
     }
 
-    /// Return a mutable pointer to the beginning of the memory region
-    ///
-    /// # Safety
-    ///
-    /// Returns a mutable pointer that should ONLY be used to pass to `libbpf_sys::xsk_umem__create`
-    /// and can guaranteed to be valid (non-null), but only prevents aliasing by using various queues to
-    /// pass ownership to and from the kernel (and ourselves). This is still marked unsafe because it is
-    /// not safe to just blindly pass, keep, mutate multiple pointers that are created by this function.
     pub(crate) unsafe fn as_mut_ptr(&mut self) -> *mut libc::c_void {
         self.mem_ptr.as_ptr() as _
     }
@@ -914,29 +812,6 @@ impl Buf {
         Buf {
             inner: ptr::NonNull::new_unchecked(Box::into_raw(inner)),
         }
-    }
-
-    unsafe fn memory_region(&self) -> &MemoryRegion {
-        &self.inner.as_ref().umem.as_ref().memory.borrow()
-    }
-
-    unsafe fn memory_region_mut(&mut self) -> &mut MemoryRegion {
-        &mut self.inner.as_mut().umem.as_mut().memory.borrow_mut()
-    }
-}
-
-impl ops::Deref for Buf {
-    type Target = MemoryRegion;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { self.memory_region() }
-    }
-}
-
-impl ops::DerefMut for Buf {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        assert!(unsafe { self.inner.as_ref().refcount.get() } <= 1);
-        unsafe { self.memory_region_mut() }
     }
 }
 
@@ -1013,12 +888,10 @@ impl FrameBuf {
         self.inner.frame.options.set(options);
     }
 
-    /// L2 MAC destination slice
     pub fn mac_dst(&self) -> &[u8] {
         &self[..6]
     }
 
-    /// Mutable access to L2 MAC destination slice
     pub fn mac_dst_mut(&mut self) -> &mut [u8] {
         &mut self[..6]
     }
@@ -1236,7 +1109,8 @@ impl ops::DerefMut for FrameBuf {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // TODO: We may have to eventually remove the refcell wrapper because it could
         // be too easy to trip on, when we know it's actually probably safe to just give
-        // out the slice assuming we don't make multiple ways to access this exact slice.
+        // out the slice assuming we don't make multiple ways to access this exact
+        // slice.
         let inner = &self.inner;
         // println!("Before DerefMut for frame: {:?}", inner.frame);
         let mut umem = inner.umem.borrow_mut();
@@ -1273,7 +1147,6 @@ impl Drop for FrameBuf {
 }
 
 /// Xsk socket configuration
-///
 #[derive(Debug, Clone, Copy)]
 pub struct XskSocketConfig {
     pub(crate) if_name: &'static str,
@@ -1314,7 +1187,6 @@ pub struct XskSocketConfigBuilder {
 
 impl XskSocketConfigBuilder {
     /// set which interface the socket is for
-    ///
     pub fn if_name(self, name: &'static str) -> XskSocketConfigBuilder {
         XskSocketConfigBuilder {
             if_name: Some(name),
@@ -1609,40 +1481,22 @@ pub(crate) mod tests {
             .spin_before_park(Duration::from_secs(1))
             .make()?;
 
-        // Run the network traffic. In this case ping in the other network namespace.
         let mut child = run_ping_command();
 
         local.run(async move {
-            // Let the ping command initially work by not engaging the xdp socket, s/t it sends at
-            // full speed. This won't happen if it starts and the xdp socket just swallows the initial
-            // frames
             crate::timer::sleep(Duration::from_secs(1)).await;
-
-            // Create / engage the xdp socket
             let mut socket = XskSocketDriver::new(sock_config, umem.clone()).unwrap();
-
-            // Fill descriptors so we can recieve frames
             umem.borrow_mut().fill_descriptors(50);
-
-            // make an initial non-blocking, zero syscall attempt to recv frames.. usually won't receive any
             let rx = socket.consume_rx_owned(20);
-
-            // Let some frames get sent for 4 seconds..
             crate::timer::sleep(Duration::from_secs(4)).await;
             let res = nix::poll::poll(
                 &mut [PollFd::new(socket.fd, nix::poll::PollFlags::POLLIN)],
                 -1,
             );
             let available = socket.rx_count();
-            // @HACK Just picking 20 as a safe number that should be easy to satisfy in these conditions..
-            // Usually does ~30 but wanna leave some room for a few to not make it.
             assert!(available >= 20);
-
-            // Check a bunch of the queue counts
             let cached_avail = socket.rx_count_cached();
             dbg!(available, cached_avail);
-
-            // Actually consume some RX frames. At most will get 50 of them.
             let mut rx = socket.consume_rx_owned(50);
             let after_available = socket.rx_count();
             let tx_count = socket.tx_count();
@@ -1759,29 +1613,16 @@ pub(crate) mod tests {
         let mut child = run_ping_command();
 
         local.run(async move {
-            // Let the ping command initially work by not engaging the xdp socket, s/t it sends at
-            // full speed. This won't happen if it starts and the xdp socket just swallows the initial
-            // frames
             crate::timer::sleep(Duration::from_secs(1)).await;
-
-            // Create / engage the xdp socket
             let mut socket = XskSocketDriver::new(sock_config, umem.clone()).unwrap();
-
-            // Fill descriptors so we can recieve frames
             umem.borrow_mut().fill_descriptors(50);
-
-            // make an initial non-blocking, zero syscall attempt to recv frames.. usually won't receive any
             let rx = socket.consume_rx_owned(20);
-
-            // Let some frames get sent for 4 seconds..
             crate::timer::sleep(Duration::from_secs(4)).await;
             let res = nix::poll::poll(
                 &mut [PollFd::new(socket.fd, nix::poll::PollFlags::POLLIN)],
                 -1,
             );
             let available = socket.rx_count();
-            // @HACK Just picking 20 as a safe number that should be easy to satisfy in these conditions..
-            // Usually does ~30 but wanna leave some room for a few to not make it.
             assert!(available >= 20);
 
             // Check a bunch of the queue counts

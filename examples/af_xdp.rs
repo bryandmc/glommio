@@ -1,11 +1,15 @@
 use std::{cell::RefCell, io, rc::Rc, time::Duration};
 
-use glommio::net::xdp::XdpSocket;
 use glommio::{
-    net::{xdp::XdpConfig, UdpSocket},
-    timer, Local,
+    net::{
+        xdp::{XdpConfig, XdpSocket},
+        UdpSocket,
+    },
+    timer,
+    Local,
+    LocalExecutorBuilder,
+    Task,
 };
-use glommio::{LocalExecutorBuilder, Task};
 
 fn main() -> Result<(), io::Error> {
     let mut builder = LocalExecutorBuilder::default();
