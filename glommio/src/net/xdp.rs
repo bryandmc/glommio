@@ -1,4 +1,5 @@
-use iou::PollFlags;
+//!
+//! XDP socket support
 
 use crate::{
     error::ReactorErrorKind,
@@ -14,6 +15,7 @@ use crate::{
     GlommioError,
     Local,
 };
+use nix::poll::PollFlags;
 use std::{cell::RefCell, convert::TryInto, mem::ManuallyDrop, rc::Rc};
 
 type Result<T> = std::result::Result<T, GlommioError<()>>;
@@ -497,7 +499,7 @@ mod tests {
                     "Sent {} items. Pending completions queue: {}, free descriptor queue: {}",
                     resp,
                     sock.umem.borrow().pending_completions.len(),
-                    sock.umem.borrow().free_list.len()
+                    sock.umem.borrow().free_list.borrow().len()
                 );
             }
             dbg!(&sock.umem.borrow().pending_completions.len());

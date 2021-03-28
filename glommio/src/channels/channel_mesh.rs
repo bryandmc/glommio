@@ -51,17 +51,24 @@ impl<T: Send> Senders<T> {
     ///
     /// See [`ConnectedSender.send`] for how the underlying sender works.
     ///
-    /// [`GlommioError::IoError`]:
-    /// ../../error/enum.GlommioError.html#variant.IoError [`InvalidInput`]: https://doc.rust-lang.org/std/io/enum.ErrorKind.html#variant.InvalidInput
+    /// [`GlommioError::IoError`]: crate::GlommioError::IoError
+    /// [`InvalidInput`]: https://doc.rust-lang.org/std/io/enum.ErrorKind.html#variant.InvalidInput
     /// [`ConnectedSender.send`]:
-    /// ../shared_channel/struct.ConnectedSender.html#method.send
+    /// crate::channels::shared_channel::ConnectedSender::send
     pub async fn send_to(&self, idx: usize, msg: T) -> Result<(), T> {
         match self.senders.get(idx) {
             Some(Some(consumer)) => consumer.send(msg).await,
-            _ => Err(GlommioError::IoError(Error::new(
-                ErrorKind::InvalidInput,
-                "Local message should not be sent via channel mesh",
-            ))),
+            _ => {
+                let msg = if idx < self.nr_consumers() {
+                    "Local message should not be sent via channel mesh".into()
+                } else {
+                    format!("Shard {} is invalid in the channel mesh", idx)
+                };
+                Err(GlommioError::IoError(Error::new(
+                    ErrorKind::InvalidInput,
+                    msg,
+                )))
+            }
         }
     }
 
@@ -73,10 +80,10 @@ impl<T: Send> Senders<T> {
     ///
     /// See [`ConnectedSender.try_send`] for how the underlying sender works.
     ///
-    /// [`GlommioError::IoError`]:
-    /// ../../error/enum.GlommioError.html#variant.IoError [`InvalidInput`]: https://doc.rust-lang.org/std/io/enum.ErrorKind.html#variant.InvalidInput
+    /// [`GlommioError::IoError`]: crate::GlommioError::IoError
+    /// [`InvalidInput`]: https://doc.rust-lang.org/std/io/enum.ErrorKind.html#variant.InvalidInput
     /// [`ConnectedSender.try_send`]:
-    /// ../shared_channel/struct.ConnectedSender.html#method.try_send
+    /// crate::channels::shared_channel::ConnectedSender::try_send
     pub fn try_send_to(&self, idx: usize, msg: T) -> Result<(), T> {
         match self.senders.get(idx) {
             Some(Some(consumer)) => consumer.try_send(msg),
@@ -129,10 +136,10 @@ impl<T: Send> Receivers<T> {
     ///
     /// See [`ConnectedReceiver.recv`] for how the underlying sender works.
     ///
-    /// [`GlommioError::IoError`]:
-    /// ../../error/enum.GlommioError.html#variant.IoError [`InvalidInput`]: https://doc.rust-lang.org/std/io/enum.ErrorKind.html#variant.InvalidInput
+    /// [`GlommioError::IoError`]: crate::GlommioError::IoError
+    /// [`InvalidInput`]: https://doc.rust-lang.org/std/io/enum.ErrorKind.html#variant.InvalidInput
     /// [`ConnectedReceiver.recv`]:
-    /// ../shared_channel/struct.ConnectedReceiver.html#method.recv
+    /// crate::channels::shared_channel::ConnectedReceiver::recv
     pub async fn recv_from(&self, idx: usize) -> Result<Option<T>, ()> {
         match self.receivers.get(idx) {
             Some(Some(producer)) => Ok(producer.recv().await),
@@ -243,7 +250,7 @@ impl MeshAdapter for Partial {
 }
 
 /// Alias for partial mesh builder
-pub type PartialMesh<T> = MeshBuilder<T, Full>;
+pub type PartialMesh<T> = MeshBuilder<T, Partial>;
 
 /// A builder for channel mesh
 pub struct MeshBuilder<T: Send, A: MeshAdapter> {

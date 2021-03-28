@@ -1300,54 +1300,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn buf_test() {
-        unsafe {
-            let umem = Box::new(Umem::new(10, UmemConfig::default().into()).unwrap());
-            let umem_ptr = ptr::NonNull::new_unchecked(Box::into_raw(umem));
-            let b = Buf {
-                inner: ptr::NonNull::new_unchecked(&mut Inner {
-                    umem: umem_ptr,
-                    frame: FrameRef {
-                        addr: 0.into(),
-                        len: 0.into(),
-                        options: 0.into(),
-                        in_queue: false,
-                    },
-                    refcount: Cell::new(1),
-                }),
-            };
-
-            dbg!(&b, b.inner.as_ref());
-            let bb = Buf::new(umem_ptr, None);
-            let bbb = Buf::new(
-                umem_ptr,
-                FrameRef {
-                    addr: Cell::new(2),
-                    len: Cell::new(1500),
-                    options: Cell::new(0),
-                    in_queue: true,
-                },
-            );
-            let mut bbbb = bbb.clone();
-            dbg!(
-                (&bb, bb.inner.as_ref()),
-                (&bbb, bbb.inner.as_ref()),
-                (&bbbb, bbbb.inner.as_ref())
-            );
-
-            let slice = &bbbb.memory_region()[..10];
-            dbg!(slice);
-
-            drop(bbb);
-            let slice_again = &bbbb[..10];
-            dbg!(slice_again);
-            &mut bbbb[..10].copy_from_slice(b"0123456789");
-            let mutable_slice = &bbbb[..10];
-            dbg!(mutable_slice);
-        }
-    }
-
-    #[test]
     fn frame_buf_drop_requeue() {
         let umem = Rc::new(RefCell::new(
             Umem::new(10, UmemConfig::default().into()).unwrap(),

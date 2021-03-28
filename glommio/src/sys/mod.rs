@@ -3,8 +3,9 @@
 //
 // This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //
+use crate::{iou::sqe::SockAddrStorage, uring_sys};
 use ahash::AHashMap;
-use iou::{SockAddr, SockAddrStorage};
+use nix::sys::socket::SockAddr;
 use std::{
     cell::{Cell, RefCell},
     convert::TryFrom,
@@ -213,6 +214,7 @@ fn cstr(path: &Path) -> io::Result<CString> {
 mod dma_buffer;
 #[cfg(feature = "xdp")]
 pub(crate) mod ebpf;
+
 pub(crate) mod sysfs;
 mod uring;
 
@@ -346,12 +348,6 @@ pub(crate) enum PollableStatus {
     NonPollable(DirectIO),
 }
 
-#[derive(Debug, Copy, Clone)]
-pub(crate) enum LinkStatus {
-    Freestanding,
-    Linked,
-}
-
 #[derive(Debug)]
 pub(crate) enum SourceType {
     Write(PollableStatus, IOBuffer),
@@ -374,7 +370,7 @@ pub(crate) enum SourceType {
     FdataSync,
     Fallocate,
     Close,
-    LinkRings(LinkStatus),
+    LinkRings,
     Statx(CString, Box<RefCell<libc::statx>>),
     Timeout(TimeSpec64),
     Connect(SockAddr),
@@ -399,6 +395,7 @@ impl TryFrom<SourceType> for libc::statx {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct TimeSpec64 {
     raw: uring_sys::__kernel_timespec,
 }
@@ -418,6 +415,12 @@ impl fmt::Debug for TimeSpec64 {
 
 impl From<&'_ TimeSpec64> for Duration {
     fn from(ts: &TimeSpec64) -> Self {
+        Duration::new(ts.raw.tv_sec as u64, ts.raw.tv_nsec as u32)
+    }
+}
+
+impl From<TimeSpec64> for Duration {
+    fn from(ts: TimeSpec64) -> Self {
         Duration::new(ts.raw.tv_sec as u64, ts.raw.tv_nsec as u32)
     }
 }
@@ -464,6 +467,8 @@ pub struct InnerSource {
 
     io_requirements: IoRequirements,
 
+    timeout: RefCell<Option<TimeSpec64>>,
+
     enqueued: Cell<Option<EnqueuedSource>>,
 }
 
@@ -498,6 +503,7 @@ impl Source {
                 source_type: RefCell::new(source_type),
                 io_requirements: ioreq,
                 enqueued: Cell::new(None),
+                timeout: RefCell::new(None),
             }),
         }
     }

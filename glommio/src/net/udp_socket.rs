@@ -4,12 +4,13 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //
 use super::datagram::GlommioDatagram;
-use iou::{InetAddr, SockAddr};
+use nix::sys::socket::{InetAddr, SockAddr};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     io,
     net::{self, SocketAddr, ToSocketAddrs},
     os::unix::io::{AsRawFd, FromRawFd, RawFd},
+    time::Duration,
 };
 
 type Result<T> = crate::Result<T, ()>;
@@ -142,6 +143,56 @@ impl UdpSocket {
     /// gets the buffer size used
     pub fn buffer_size(&mut self) -> usize {
         self.socket.rx_buf_size
+    }
+
+    /// Sets the read timeout to the timeout specified.
+    ///
+    /// If the value specified is [`None`], then read calls will block
+    /// indefinitely. An [`Err`] is returned if the zero [`Duration`] is
+    /// passed to this method.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use glommio::{net::UdpSocket, LocalExecutor};
+    /// # use std::time::Duration;
+    /// # let ex = LocalExecutor::default();
+    /// # ex.run(async move {
+    /// let s = UdpSocket::bind("127.0.0.1:10000").unwrap();
+    /// s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    /// # })
+    /// ```
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        self.socket.set_read_timeout(dur)
+    }
+
+    /// Sets the write timeout to the timeout specified.
+    ///
+    /// If the value specified is [`None`], then write calls will block
+    /// indefinitely. An [`Err`] is returned if the zero [`Duration`] is
+    /// passed to this method.
+    ///
+    /// ```no_run
+    /// # use glommio::{net::UdpSocket, LocalExecutor};
+    /// # use std::time::Duration;
+    /// # let ex = LocalExecutor::default();
+    /// # ex.run(async move {
+    /// let s = UdpSocket::bind("127.0.0.1:10000").unwrap();
+    /// s.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+    /// # })
+    /// ```
+    pub fn set_write_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        self.socket.set_write_timeout(dur)
+    }
+
+    /// Returns the read timeout of this socket.
+    pub fn read_timeout(&self) -> Option<Duration> {
+        self.socket.read_timeout()
+    }
+
+    /// Returns the write timeout of this socket.
+    pub fn write_timeout(&self) -> Option<Duration> {
+        self.socket.write_timeout()
     }
 
     /// Receives single datagram on the socket from the remote address to which
@@ -359,6 +410,7 @@ impl UdpSocket {
 mod tests {
     use super::*;
     use crate::{timer::Timer, Local, LocalExecutorBuilder};
+    use nix::sys::socket::MsgFlags;
     use std::time::Duration;
 
     macro_rules! connected_pair {
@@ -578,14 +630,14 @@ mod tests {
                 for _ in 0..10 {
                     let (sz, _) = receiver
                         .socket
-                        .recv_from_blocking(&mut buf, iou::MsgFlags::MSG_PEEK)
+                        .recv_from_blocking(&mut buf, MsgFlags::MSG_PEEK)
                         .await
                         .unwrap();
                     assert_eq!(sz, 1);
                 }
                 let (_, from) = receiver
                     .socket
-                    .recv_from_blocking(&mut buf, iou::MsgFlags::MSG_PEEK)
+                    .recv_from_blocking(&mut buf, MsgFlags::MSG_PEEK)
                     .await
                     .unwrap();
                 let addr = match from {
@@ -635,7 +687,7 @@ mod tests {
                 let mut buf = [0u8; 1];
                 let (sz, from) = receiver
                     .socket
-                    .recv_from_blocking(&mut buf, iou::MsgFlags::empty())
+                    .recv_from_blocking(&mut buf, MsgFlags::empty())
                     .await
                     .unwrap();
                 assert_eq!(sz, 1);

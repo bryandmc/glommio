@@ -45,7 +45,9 @@ This is likely file, but in extreme situations can lead to resource exhaustion. 
                  asynchronous close is still preferred",
                 self.path, file
             );
-            self.reactor.upgrade().map(|r| r.close(file));
+            if let Some(r) = self.reactor.upgrade() {
+                r.sys.async_close(file);
+            }
         }
     }
 }
@@ -187,16 +189,7 @@ impl GlommioFile {
 
     pub(crate) async fn rename<P: AsRef<Path>>(&mut self, new_path: P) -> Result<()> {
         let old_path = self.path_required("rename")?;
-        crate::io::rename(old_path, &new_path)
-            .await
-            .map_err(|source| {
-                GlommioError::create_enhanced(
-                    source,
-                    "Renaming",
-                    self.path.as_ref(),
-                    Some(self.as_raw_fd()),
-                )
-            })?;
+        crate::io::rename(old_path, &new_path).await?;
         self.path = Some(new_path.as_ref().to_owned());
         Ok(())
     }
@@ -250,5 +243,42 @@ impl GlommioFile {
     pub(crate) async fn file_size(&self) -> Result<u64> {
         let st = self.statx().await?;
         Ok(st.stx_size)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test {
+    use super::*;
+    use crate::{test_utils::*, timer::sleep};
+    use std::time::Duration;
+
+    #[test]
+    fn drop_closes_the_file() {
+        test_executor!(async move {
+            let dir = make_tmp_test_directory("drop_closes_the_file");
+            let path = dir.path.clone();
+
+            let file = path.join("file");
+            let gf = GlommioFile::open_at(-1, &file, libc::O_CREAT, 0644)
+                .await
+                .unwrap();
+            let gf_fd = gf.path.as_ref().cloned().unwrap();
+
+            let file_list = || {
+                let mut files = vec![];
+                for f in std::fs::read_dir("/proc/self/fd").unwrap() {
+                    let f = f.unwrap().path();
+                    if let Ok(file) = std::fs::canonicalize(&f) {
+                        files.push(file);
+                    }
+                }
+                files
+            };
+
+            assert!(file_list().iter().find(|&x| *x == gf_fd).is_some()); // sanity check that file is open
+            let _ = { gf }; // moves scope and drops
+            sleep(Duration::from_millis(10)).await; // forces the reactor to run, which will drop the file
+            assert!(file_list().iter().find(|&x| *x == gf_fd).is_none()); // file is gone
+        });
     }
 }

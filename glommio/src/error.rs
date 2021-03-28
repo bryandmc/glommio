@@ -9,6 +9,7 @@ use std::{
     num::TryFromIntError,
     os::unix::io::RawFd,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 /// Result type alias that all Glommio public API functions can use.
@@ -41,6 +42,10 @@ pub enum ResourceType<T> {
     /// ([`BufferedFile`](crate::io::BufferedFile)) and Direct
     /// ([`DmaFile`](crate::io::DmaFile)) file I/O variants.
     File(String),
+
+    /// Gate variant used for reporting errors for the
+    /// [`Gate`](crate::sync::Gate) type.
+    Gate,
 }
 
 /// Error variants for executor queues.
@@ -166,6 +171,8 @@ pub enum GlommioError<T> {
 
     /// Error casting integers from different sizes.
     InvalidIntegerCast(TryFromIntError),
+    /// Timeout variant used for reporting timed out operations
+    TimedOut(Duration),
 }
 
 impl<T> From<io::Error> for GlommioError<T> {
@@ -183,73 +190,52 @@ impl<T> From<TryFromIntError> for GlommioError<T> {
 impl<T> fmt::Display for GlommioError<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            GlommioError::IoError(err) => {
-                write!(f, "IO error occurred: {}", err)
-            }
+            GlommioError::IoError(err) => write!(f, "IO error occurred: {}", err),
             GlommioError::EnhancedIoError {
                 source,
                 op,
                 path,
                 fd,
-            } => {
-                write!(
-                    f,
-                    "{}, op: {} path: {:?} with fd: {:?}",
-                    source, op, path, fd
-                )
-            }
-            GlommioError::ExecutorError(err) => {
-                write!(f, "Executor error: {}", err)
-            }
+            } => write!(
+                f,
+                "{}, op: {} path: {:?} with fd: {:?}",
+                source, op, path, fd
+            ),
+            GlommioError::ExecutorError(err) => write!(f, "Executor error: {}", err),
             GlommioError::Closed(rt) => match rt {
                 ResourceType::Semaphore {
                     requested,
                     available,
-                } => {
-                    write!(
-                        f,
-                        "Semaphore is closed (requested: {}, available: {})",
-                        requested, available
-                    )
-                }
-                ResourceType::RwLock => {
-                    write!(f, "RwLock is closed")
-                }
-                ResourceType::Channel(_) => {
-                    write!(f, "Channel is closed")
-                }
+                } => write!(
+                    f,
+                    "Semaphore is closed (requested: {}, available: {})",
+                    requested, available
+                ),
+                ResourceType::RwLock => write!(f, "RwLock is closed"),
+                ResourceType::Channel(_) => write!(f, "Channel is closed"),
                 // TODO: look at what this format string should be as per bug report..
-                ResourceType::File(msg) => {
-                    write!(f, "File is closed ({})", msg)
-                }
+                ResourceType::File(msg) => write!(f, "File is closed ({})", msg),
+                ResourceType::Gate => write!(f, "Gate is closed"),
             },
             GlommioError::WouldBlock(rt) => match rt {
                 ResourceType::Semaphore {
                     requested,
                     available,
-                } => {
-                    write!(
-                        f,
-                        "Semaphore operation would block (requested: {}, available: {})",
-                        requested, available
-                    )
-                }
-                ResourceType::RwLock => {
-                    write!(f, "RwLock operation would block")
-                }
-                ResourceType::Channel(_) => {
-                    write!(f, "Channel operation would block")
-                }
-                ResourceType::File(msg) => {
-                    write!(f, "File operation would block ({})", msg)
-                }
+                } => write!(
+                    f,
+                    "Semaphore operation would block (requested: {}, available: {})",
+                    requested, available
+                ),
+                ResourceType::RwLock => write!(f, "RwLock operation would block"),
+                ResourceType::Channel(_) => write!(f, "Channel operation would block"),
+                ResourceType::File(msg) => write!(f, "File operation would block ({})", msg),
+                ResourceType::Gate => write!(f, "Gate operation would block"),
             },
-            GlommioError::ReactorError(err) => {
-                write!(f, "Reactor error: {}", err)
-            }
             GlommioError::InvalidIntegerCast(err) => {
                 write!(f, "Invalid integer cast: {}", err)
             }
+            GlommioError::ReactorError(err) => write!(f, "Reactor error: {}", err),
+            GlommioError::TimedOut(dur) => write!(f, "Operation timed out after {:#?}", dur),
         }
     }
 }
@@ -283,6 +269,28 @@ impl<T> From<(io::Error, ResourceType<T>)> for GlommioError<T> {
 }
 
 impl<T> GlommioError<T> {
+    /// Returns the OS error that this error represents (if any).
+    ///
+    /// If this `Error` was constructed from an [`io::Error`] which encapsulates
+    /// a raw OS error, then this function will return [`Some`], otherwise
+    /// it will return [`None`].
+    ///
+    /// [`io::Error`]: https://doc.rust-lang.org/std/io/struct.Error.html
+    /// [`Some`]: https://doc.rust-lang.org/std/option/enum.Option.html#variant.Some
+    /// [`None`]: https://doc.rust-lang.org/std/option/enum.Option.html#variant.None
+    pub fn raw_os_error(&self) -> Option<i32> {
+        match self {
+            GlommioError::IoError(x) => x.raw_os_error(),
+            GlommioError::EnhancedIoError {
+                source,
+                op: _,
+                path: _,
+                fd: _,
+            } => source.raw_os_error(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn queue_still_active(index: usize) -> GlommioError<T> {
         GlommioError::ExecutorError(ExecutorErrorKind::QueueError {
             index,
@@ -317,6 +325,7 @@ impl<T> fmt::Display for ResourceType<T> {
             ResourceType::RwLock => "RwLock".to_string(),
             ResourceType::Channel(_) => "Channel".to_string(),
             ResourceType::File(_) => "File".to_string(),
+            ResourceType::Gate => "Gate".to_string(),
         };
         write!(f, "{}", &fmt_str)
     }
@@ -343,6 +352,7 @@ impl<T> Debug for GlommioError<T> {
                 ResourceType::RwLock => write!(f, "RwLock is closed {{ .. }}"),
                 ResourceType::Channel(_) => write!(f, "Channel is closed {{ .. }}"),
                 ResourceType::File(msg) => write!(f, "File is closed (\"{}\")", msg),
+                ResourceType::Gate => write!(f, "Gate is closed"),
             },
             GlommioError::WouldBlock(resource) => match resource {
                 ResourceType::Semaphore {
@@ -356,6 +366,7 @@ impl<T> Debug for GlommioError<T> {
                 ResourceType::RwLock => write!(f, "RwLock operation would block {{ .. }}"),
                 ResourceType::Channel(_) => write!(f, "Channel operation  would block {{ .. }}"),
                 ResourceType::File(msg) => write!(f, "File operation would block (\"{}\")", msg),
+                ResourceType::Gate => write!(f, "Gate operation would block {{ .. }}"),
             },
             GlommioError::ExecutorError(kind) => match kind {
                 ExecutorErrorKind::QueueError { index, kind } => f.write_fmt(format_args!(
@@ -371,13 +382,11 @@ impl<T> Debug for GlommioError<T> {
                 op,
                 path,
                 fd,
-            } => {
-                write!(
-                    f,
-                    "EnhancedIoError {{ source: {:?}, op: {:?}, path: {:?}, fd: {:?} }}",
-                    source, op, path, fd
-                )
-            }
+            } => write!(
+                f,
+                "EnhancedIoError {{ source: {:?}, op: {:?}, path: {:?}, fd: {:?} }}",
+                source, op, path, fd
+            ),
             GlommioError::ReactorError(kind) => {
                 let kind = match kind {
                     ReactorErrorKind::IncorrectSourceType => "IncorrectSourceType",
@@ -388,6 +397,7 @@ impl<T> Debug for GlommioError<T> {
             GlommioError::InvalidIntegerCast(inner) => {
                 write!(f, "InvalidIntegerCase {{ inner: '{}' }}", inner)
             }
+            GlommioError::TimedOut(dur) => write!(f, "TimedOut {{ dur {:?} }}", dur),
         }
     }
 }
@@ -422,6 +432,10 @@ impl<T> From<GlommioError<T>> for io::Error {
                 io::Error::new(io::ErrorKind::InvalidData, "Incorrect source type!")
             }
             GlommioError::InvalidIntegerCast(inner) => io::Error::new(io::ErrorKind::Other, inner),
+            GlommioError::TimedOut(dur) => io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out after {:#?}", dur),
+            ),
         }
     }
 }

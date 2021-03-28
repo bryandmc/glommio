@@ -109,7 +109,7 @@ impl DmaBuffer {
         }
     }
 
-    pub(crate) fn uring_buffer_id(&self) -> Option<usize> {
+    pub(crate) fn uring_buffer_id(&self) -> Option<u32> {
         match &self.storage {
             BufferStorage::Uring(x) => x.uring_buffer_id(),
             _ => None,
@@ -229,5 +229,3 @@ mod umem {
         }
     }
 }
-
-// something

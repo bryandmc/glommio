@@ -21,7 +21,8 @@
 //! of [`std::sync::RwLock`]. With exception that RwLock can not be poisoned but
 //! can be closed.
 
+mod gate;
 mod rwlock;
 mod semaphore;
 
-pub use self::{rwlock::*, semaphore::*};
+pub use self::{gate::*, rwlock::*, semaphore::*};

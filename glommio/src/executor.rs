@@ -68,7 +68,7 @@ type Result<T> = crate::Result<T, ()>;
 
 scoped_thread_local!(static LOCAL_EX: LocalExecutor);
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 /// An opaque handle indicating in which queue a group of tasks will execute.
 /// Tasks in the same group will execute in FIFO order but no guarantee is made
 /// about ordering on different task queues.
@@ -79,6 +79,13 @@ pub struct TaskQueueHandle {
 impl Default for TaskQueueHandle {
     fn default() -> Self {
         TaskQueueHandle { index: 0 }
+    }
+}
+
+impl TaskQueueHandle {
+    /// Returns a numeric ID that uniquely identifies this Task queue
+    pub fn index(&self) -> usize {
+        self.index
     }
 }
 
@@ -197,6 +204,8 @@ fn bind_to_cpu(cpu: usize) -> Result<()> {
 /// Allows information about the current state of this executor to be consumed
 /// by applications.
 pub struct ExecutorStats {
+    executor_runtime: Duration,
+    // total_runtime include poll_io time, exclude spin loop time
     total_runtime: Duration,
     scheduler_runs: u64,
     tasks_executed: u64,
@@ -205,6 +214,7 @@ pub struct ExecutorStats {
 impl ExecutorStats {
     fn new() -> Self {
         Self {
+            executor_runtime: Duration::from_nanos(0),
             total_runtime: Duration::from_nanos(0),
             scheduler_runs: 0,
             tasks_executed: 0,
@@ -217,6 +227,11 @@ impl ExecutorStats {
     /// CPU time you will see in the operating system will be a far cry from
     /// the CPU time it actually spent executing. Sleeping or Spinning are
     /// not accounted here
+    pub fn executor_runtime(&self) -> Duration {
+        self.executor_runtime
+    }
+
+    /// The total amount of runtime in this executor, plus poll io time
     pub fn total_runtime(&self) -> Duration {
         self.total_runtime
     }
@@ -293,19 +308,21 @@ struct ExecutorQueues {
     executor_index: usize,
     last_vruntime: u64,
     preempt_timer_duration: Duration,
+    default_preempt_timer_duration: Duration,
     spin_before_park: Option<Duration>,
     stats: ExecutorStats,
 }
 
 impl ExecutorQueues {
-    fn new() -> Rc<RefCell<Self>> {
+    fn new(preempt_timer_duration: Duration) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(ExecutorQueues {
             active_executors: BinaryHeap::new(),
             available_executors: AHashMap::new(),
             active_executing: None,
             executor_index: 1, // 0 is the default
             last_vruntime: 0,
-            preempt_timer_duration: Duration::from_millis(100),
+            preempt_timer_duration,
+            default_preempt_timer_duration: preempt_timer_duration,
             spin_before_park: None,
             stats: ExecutorStats::new(),
         }))
@@ -316,11 +333,11 @@ impl ExecutorQueues {
             .active_executors
             .iter()
             .map(|tq| match tq.borrow().io_requirements.latency_req {
-                Latency::NotImportant => Duration::from_millis(100),
+                Latency::NotImportant => self.default_preempt_timer_duration,
                 Latency::Matters(d) => d,
             })
             .min()
-            .unwrap_or_else(|| Duration::from_secs(1))
+            .unwrap_or(self.default_preempt_timer_duration)
     }
 
     fn maybe_activate(&mut self, queue: Rc<RefCell<TaskQueue>>) {
@@ -382,7 +399,8 @@ pub struct LocalExecutorBuilder {
     /// that but it will come from the standard allocator and performance
     /// will suffer. Defaults to 10MB.
     io_memory: usize,
-
+    /// How often to yield to other task queues
+    preempt_timer_duration: Duration,
     #[cfg(feature = "xdp")]
     xdp_config: Option<XdpConfig>,
 }
@@ -396,6 +414,7 @@ impl LocalExecutorBuilder {
             spin_before_park: None,
             name: String::from("unnamed"),
             io_memory: 10 << 20,
+            preempt_timer_duration: Duration::from_millis(100),
             #[cfg(feature = "xdp")]
             xdp_config: None,
         }
@@ -439,6 +458,22 @@ impl LocalExecutorBuilder {
         self
     }
 
+    /// How often [`need_preempt`] will return true by default.
+    ///
+    /// Lower values mean task queues will switch execution more often, which
+    /// can help latency but harm throughput. When individual task queues
+    /// are present, this value can still be dynamically lowered through the
+    /// [`Latency`] setting.
+    ///
+    /// Default is 100ms.
+    ///
+    /// [`need_preempt`]: Task::need_preempt
+    /// [`Latency`]: crate::Latency
+    pub fn preempt_timer(mut self, dur: Duration) -> LocalExecutorBuilder {
+        self.preempt_timer_duration = dur;
+        self
+    }
+
     /// Make a new [`LocalExecutor`] by taking ownership of the Builder, and
     /// returns a [`Result`](crate::Result) to the executor.
     /// # Examples
@@ -450,15 +485,19 @@ impl LocalExecutorBuilder {
     /// ```
     pub fn make(self) -> Result<LocalExecutor> {
         let notifier = sys::new_sleep_notifier()?;
+
         #[cfg(feature = "xdp")]
         let mut le = LocalExecutor::new(
             notifier,
             self.io_memory,
             self.xdp_config
                 .expect("ERROR must create XDP config in executor builder before using it."),
+            self.preempt_timer_duration,
         );
+
         #[cfg(not(feature = "xdp"))]
-        let mut le = LocalExecutor::new(notifier, self.io_memory);
+        let mut le = LocalExecutor::new(notifier, self.io_memory, self.preempt_timer_duration);
+
         if let Some(cpu) = self.binding {
             le.bind_to_cpu(cpu)?;
             le.queues.borrow_mut().spin_before_park = self.spin_before_park;
@@ -524,10 +563,18 @@ impl LocalExecutorBuilder {
         Builder::new()
             .name(name)
             .spawn(move || {
-                #[cfg(feature = "xdp")]
-                let mut le = LocalExecutor::new(notifier, self.io_memory, self.xdp_config.unwrap());
                 #[cfg(not(feature = "xdp"))]
-                let mut le = LocalExecutor::new(notifier, self.io_memory);
+                let mut le =
+                    LocalExecutor::new(notifier, self.io_memory, self.preempt_timer_duration);
+
+                #[cfg(feature = "xdp")]
+                let mut le = LocalExecutor::new(
+                    notifier,
+                    self.io_memory,
+                    self.xdp_config.unwrap(),
+                    self.preempt_timer_duration,
+                );
+
                 if let Some(cpu) = self.binding {
                     le.bind_to_cpu(cpu).unwrap();
                     le.queues.borrow_mut().spin_before_park = self.spin_before_park;
@@ -605,10 +652,14 @@ impl LocalExecutor {
     }
 
     #[cfg(not(feature = "xdp"))]
-    fn new(notifier: Arc<sys::SleepNotifier>, io_memory: usize) -> LocalExecutor {
+    fn new(
+        notifier: Arc<sys::SleepNotifier>,
+        io_memory: usize,
+        preempt_timer: Duration,
+    ) -> LocalExecutor {
         let p = parking::Parker::new();
         LocalExecutor {
-            queues: ExecutorQueues::new(),
+            queues: ExecutorQueues::new(preempt_timer),
             parker: p,
             id: notifier.id(),
             reactor: Rc::new(parking::Reactor::new(notifier, io_memory)),
@@ -620,11 +671,12 @@ impl LocalExecutor {
         notifier: Arc<sys::SleepNotifier>,
         io_memory: usize,
         config: XdpConfig,
+        preempt_timer: Duration,
     ) -> LocalExecutor {
         let p = parking::Parker::new();
         let umem = ebpf::Umem::new(config.umem_descriptors, config.into()).unwrap();
         LocalExecutor {
-            queues: ExecutorQueues::new(),
+            queues: ExecutorQueues::new(preempt_timer),
             parker: p,
             id: notifier.id(),
             reactor: Rc::new(parking::Reactor::new(notifier, io_memory, umem)),
@@ -806,7 +858,7 @@ impl LocalExecutor {
 
                 let mut tq = self.queues.borrow_mut();
                 tq.active_executing = None;
-                tq.stats.total_runtime += runtime;
+                tq.stats.executor_runtime += runtime;
                 tq.stats.tasks_executed += tasks_executed_this_loop;
 
                 tq.last_vruntime = match last_vruntime {
@@ -857,10 +909,13 @@ impl LocalExecutor {
             let future = self.spawn(async move { future.await }).detach();
             pin!(future);
 
+            let mut pre_time = Instant::now();
             loop {
                 if let Poll::Ready(t) = future.as_mut().poll(cx) {
                     // can't be canceled, and join handle is None only upon
                     // cancellation or panic. So in case of panic this just propagates
+                    let cur_time = Instant::now();
+                    self.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
                     break t.unwrap();
                 }
 
@@ -871,7 +926,11 @@ impl LocalExecutor {
                 // the opportunity to install the timer.
                 let duration = self.preempt_timer_duration();
                 self.parker.poll_io(duration);
-                if !self.run_task_queues() {
+                let run = self.run_task_queues();
+                let cur_time = Instant::now();
+                self.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
+                pre_time = cur_time;
+                if !run {
                     if let Poll::Ready(t) = future.as_mut().poll(cx) {
                         // It may be that we just became ready now that the task queue
                         // is exhausted. But if we sleep (park) we'll never know so we
@@ -879,13 +938,14 @@ impl LocalExecutor {
                         // future is probably the one setting up the task queues and etc.
                         break t.unwrap();
                     } else {
-                        let spin_start = Instant::now();
                         while !self.reactor.spin_poll_io().unwrap() {
-                            if spin_start.elapsed() > spin_before_park {
+                            if pre_time.elapsed() > spin_before_park {
                                 self.parker.park();
                                 break;
                             }
                         }
+                        // reset the timer for deduct spin loop time
+                        pre_time = Instant::now();
                     }
                 }
             }
@@ -1224,7 +1284,8 @@ impl<T> Task<T> {
     }
 
     /// Returns a [`Result`] with its `Ok` value wrapping a [`TaskQueueStats`]
-    /// or [`QueueNotFoundError`] if there is no task queue with this handle
+    /// or a [`GlommioError`] of type `[QueueErrorKind`] if there is no task
+    /// queue with this handle
     ///
     /// # Examples
     /// ```
@@ -1244,7 +1305,8 @@ impl<T> Task<T> {
     /// ```
     ///
     /// [`ExecutorStats`]: struct.ExecutorStats.html
-    /// [`QueueNotFoundError`]: struct.QueueNotFoundError.html
+    /// [`GlommioError`]: crate::error::GlommioError
+    /// [`QueueErrorKind`]: crate::error::QueueErrorKind
     /// [`Result`]: https://doc.rust-lang.org/std/result/enum.Result.html
     pub fn task_queue_stats(handle: TaskQueueHandle) -> Result<TaskQueueStats> {
         LOCAL_EX.with(|local_ex| match local_ex.get_queue(&handle) {
@@ -1686,6 +1748,67 @@ mod test {
             ex_ru_finish - ex_ru_start >= Duration::from_millis(50),
             "expected user time on LE is much greater than 50 millisecond"
         );
+    }
+
+    #[test]
+    fn test_runtime_stats() {
+        let dur = Duration::from_secs(2);
+        let ex0 = LocalExecutorBuilder::new().make().unwrap();
+        ex0.run(async {
+            assert!(
+                Local::executor_stats().total_runtime() < Duration::from_nanos(10),
+                "expected runtime on LE {:#?} is less than 10 ns",
+                Local::executor_stats().total_runtime()
+            );
+
+            let now = Instant::now();
+            while now.elapsed().as_millis() < 200 {}
+            Local::later().await;
+            assert!(
+                Local::executor_stats().total_runtime() >= Duration::from_millis(200),
+                "expected runtime on LE0 {:#?} is greater than 200 ms",
+                Local::executor_stats().total_runtime()
+            );
+
+            timer::sleep(dur).await;
+            assert!(
+                Local::executor_stats().total_runtime() < Duration::from_millis(400),
+                "expected runtime on LE0 {:#?} is not greater than 400 ms",
+                Local::executor_stats().total_runtime()
+            );
+        });
+
+        let ex = LocalExecutorBuilder::new()
+            .pin_to_cpu(0)
+            // ensure entire sleep should spin
+            .spin_before_park(Duration::from_secs(5))
+            .make()
+            .unwrap();
+        ex.run(async {
+            Local::local(async move {
+                assert!(
+                    Local::executor_stats().total_runtime() < Duration::from_nanos(10),
+                    "expected runtime on LE {:#?} is less than 10 ns",
+                    Local::executor_stats().total_runtime()
+                );
+
+                let now = Instant::now();
+                while now.elapsed().as_millis() < 200 {}
+                Local::later().await;
+                assert!(
+                    Local::executor_stats().total_runtime() >= Duration::from_millis(200),
+                    "expected runtime on LE {:#?} is greater than 200 ms",
+                    Local::executor_stats().total_runtime()
+                );
+                timer::sleep(dur).await;
+                assert!(
+                    Local::executor_stats().total_runtime() < Duration::from_millis(400),
+                    "expected runtime on LE {:#?} is not greater than 400 ms",
+                    Local::executor_stats().total_runtime()
+                );
+            })
+            .await;
+        });
     }
 
     // Spin for 2ms and then yield. How many shares we have should control how many

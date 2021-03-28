@@ -24,8 +24,13 @@
 //! those tasks on the same thread, no thread context switch is necessary when
 //! going between task execution and I/O.
 
+use crate::iou::sqe::SockAddrStorage;
 use ahash::AHashMap;
-use iou::{PollFlags, SockAddr, SockAddrStorage};
+use log::error;
+use nix::{
+    poll::PollFlags,
+    sys::socket::{MsgFlags, SockAddr},
+};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
@@ -388,6 +393,13 @@ impl Reactor {
         source
     }
 
+    pub(crate) fn connect_timeout(&self, raw: RawFd, addr: SockAddr, d: Duration) -> Source {
+        let source = self.new_source(raw, SourceType::Connect(addr));
+        source.set_timeout(d);
+        self.sys.connect(&source);
+        source
+    }
+
     pub(crate) fn accept(&self, raw: RawFd) -> Source {
         let addr = SockAddrStorage::uninit();
         let source = self.new_source(raw, SourceType::Accept(addr));
@@ -395,9 +407,17 @@ impl Reactor {
         source
     }
 
-    pub(crate) fn rushed_send(&self, fd: RawFd, buf: DmaBuffer) -> io::Result<Source> {
+    pub(crate) fn rushed_send(
+        &self,
+        fd: RawFd,
+        buf: DmaBuffer,
+        timeout: Option<Duration>,
+    ) -> io::Result<Source> {
         let source = self.new_source(fd, SourceType::SockSend(buf));
-        self.sys.send(&source, iou::MsgFlags::empty());
+        if let Some(timeout) = timeout {
+            source.set_timeout(timeout);
+        }
+        self.sys.send(&source, MsgFlags::empty());
         self.rush_dispatch(&source)?;
         Ok(source)
     }
@@ -407,6 +427,7 @@ impl Reactor {
         fd: RawFd,
         buf: DmaBuffer,
         addr: nix::sys::socket::SockAddr,
+        timeout: Option<Duration>,
     ) -> io::Result<Source> {
         let iov = libc::iovec {
             iov_base: buf.as_ptr() as *mut libc::c_void,
@@ -425,7 +446,11 @@ impl Reactor {
         };
 
         let source = self.new_source(fd, SourceType::SockSendMsg(buf, iov, hdr, addr));
-        self.sys.sendmsg(&source, iou::MsgFlags::empty());
+        if let Some(timeout) = timeout {
+            source.set_timeout(timeout);
+        }
+
+        self.sys.sendmsg(&source, MsgFlags::empty());
         self.rush_dispatch(&source)?;
         Ok(source)
     }
@@ -446,7 +471,8 @@ impl Reactor {
         &self,
         fd: RawFd,
         size: usize,
-        flags: iou::MsgFlags,
+        flags: MsgFlags,
+        timeout: Option<Duration>,
     ) -> io::Result<Source> {
         let hdr = libc::msghdr {
             msg_name: std::ptr::null_mut(),
@@ -470,19 +496,30 @@ impl Reactor {
                 std::mem::MaybeUninit::<nix::sys::socket::sockaddr_storage>::uninit(),
             ),
         );
+        if let Some(timeout) = timeout {
+            source.set_timeout(timeout);
+        }
         self.sys.recvmsg(&source, size, flags);
         self.rush_dispatch(&source)?;
         Ok(source)
     }
 
-    pub(crate) fn rushed_recv(&self, fd: RawFd, size: usize) -> io::Result<Source> {
+    pub(crate) fn rushed_recv(
+        &self,
+        fd: RawFd,
+        size: usize,
+        timeout: Option<Duration>,
+    ) -> io::Result<Source> {
         let source = self.new_source(fd, SourceType::SockRecv(None));
-        self.sys.recv(&source, size, iou::MsgFlags::empty());
+        if let Some(timeout) = timeout {
+            source.set_timeout(timeout);
+        }
+        self.sys.recv(&source, size, MsgFlags::empty());
         self.rush_dispatch(&source)?;
         Ok(source)
     }
 
-    pub(crate) fn recv(&self, fd: RawFd, size: usize, flags: iou::MsgFlags) -> Source {
+    pub(crate) fn recv(&self, fd: RawFd, size: usize, flags: MsgFlags) -> Source {
         let source = self.new_source(fd, SourceType::SockRecv(None));
         self.sys.recv(&source, size, flags);
         source
@@ -682,7 +719,9 @@ impl Reactor {
         // Wake up ready tasks.
         for waker in wakers.drain(..) {
             // Don't let a panicking waker blow everything up.
-            let _ = panic::catch_unwind(|| waker.wake());
+            if let Err(x) = panic::catch_unwind(|| waker.wake()) {
+                error!("Panic while calling waker! {:?}", x);
+            }
         }
 
         res
