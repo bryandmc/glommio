@@ -2,21 +2,11 @@
 //! XDP socket support
 
 use crate::{
-    error::ReactorErrorKind,
-    sys::ebpf::{
-        FrameBuf,
-        FrameRef,
-        Umem,
-        XdpFlags,
-        XskBindFlags,
-        XskSocketConfig,
-        XskSocketDriver,
-    },
-    GlommioError,
-    Local,
+    sys::ebpf::{FrameBuf, Umem, XdpFlags, XskBindFlags, XskSocketConfig, XskSocketDriver},
+    GlommioError, Local,
 };
 use nix::poll::PollFlags;
-use std::{cell::RefCell, convert::TryInto, mem::ManuallyDrop, rc::Rc};
+use std::{cell::RefCell, rc::Rc};
 
 type Result<T> = std::result::Result<T, GlommioError<()>>;
 
@@ -31,6 +21,9 @@ macro_rules! log_queue_counts {
     }};
 }
 
+/// XDP socket
+///
+/// A raw L2 socket backed by an AF_XDP socket.
 #[derive(Debug)]
 pub struct XdpSocket {
     driver: XskSocketDriver,
@@ -54,6 +47,7 @@ impl XdpSocket {
         })
     }
 
+    /// Bind the AF_XDP socket
     pub fn bind(if_name: &'static str, queue: u32) -> Result<XdpSocket> {
         XdpSocket::new(XdpConfig::builder(if_name, queue).build())
     }
@@ -206,7 +200,6 @@ impl XdpConfigBuilder {
         }
     }
     pub const fn tx_size(self, tx_size: u32) -> XdpConfigBuilder {
-        // dbg!(!(tx_size & (4096 - 1)));
         if tx_size & (4096 - 1) == 0 {
             return XdpConfigBuilder { tx_size, ..self };
         }
@@ -214,9 +207,7 @@ impl XdpConfigBuilder {
     }
 
     pub const fn rx_size(self, rx_size: u32) -> XdpConfigBuilder {
-        // dbg!(!(rx_size & (4096 - 1)));
         if rx_size & (4096 - 1) == 0 {
-            // panic!("Must be divisible by the page size");
             return XdpConfigBuilder { rx_size, ..self };
         }
         XdpConfigBuilder { ..self }
@@ -510,7 +501,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     #[cfg_attr(not(feature = "xdp"), ignore)]
     fn af_xdp_socket_recv() {
         let _guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());

@@ -10,6 +10,7 @@
 
 use std::ptr;
 
+#[cfg(feature = "xdp")]
 use super::ebpf;
 use crate::sys::uring::UringBuffer;
 use alloc::alloc::Layout;

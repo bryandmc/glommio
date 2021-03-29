@@ -14,8 +14,7 @@ use std::{
     cell::{Cell, Ref, RefCell, RefMut},
     collections::VecDeque,
     ffi::CStr,
-    fmt,
-    io,
+    fmt, io,
     io::{Error, ErrorKind, IoSlice},
     os::unix::io::RawFd,
     ptr,
@@ -31,16 +30,9 @@ use crate::{
     sys::{
         self,
         dma_buffer::{BufferStorage, DmaBuffer},
-        DirectIO,
-        IOBuffer,
-        InnerSource,
-        PollableStatus,
-        Source,
-        SourceType,
+        DirectIO, IOBuffer, InnerSource, PollableStatus, Source, SourceType,
     },
-    uring_sys,
-    IoRequirements,
-    Latency,
+    uring_sys, IoRequirements, Latency,
 };
 use buddy_alloc::buddy_alloc::{BuddyAlloc, BuddyAllocParam};
 use nix::sys::{

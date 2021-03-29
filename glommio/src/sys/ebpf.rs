@@ -24,18 +24,9 @@ use std::{
 };
 
 use libbpf_sys::{
-    xsk_ring_cons,
-    xsk_ring_prod,
-    xsk_socket,
-    xsk_socket_config,
-    xsk_umem,
-    xsk_umem_config,
-    XDP_FLAGS_UPDATE_IF_NOEXIST,
-    XDP_USE_NEED_WAKEUP,
-    XSK_RING_CONS__DEFAULT_NUM_DESCS,
-    XSK_RING_PROD__DEFAULT_NUM_DESCS,
-    XSK_UMEM__DEFAULT_FLAGS,
-    XSK_UMEM__DEFAULT_FRAME_HEADROOM,
+    xsk_ring_cons, xsk_ring_prod, xsk_socket, xsk_socket_config, xsk_umem, xsk_umem_config,
+    XDP_FLAGS_UPDATE_IF_NOEXIST, XDP_USE_NEED_WAKEUP, XSK_RING_CONS__DEFAULT_NUM_DESCS,
+    XSK_RING_PROD__DEFAULT_NUM_DESCS, XSK_UMEM__DEFAULT_FLAGS, XSK_UMEM__DEFAULT_FRAME_HEADROOM,
     XSK_UMEM__DEFAULT_FRAME_SIZE,
 };
 
@@ -921,7 +912,10 @@ impl FrameBuf {
             0x8100 => EtherType::VlanTaggedFrame,
             0x88A8 => EtherType::ProviderBridging,
             0x9100 => EtherType::VlanDoubleTaggedFrame,
-            et => panic!("Invalid ethertype value! Got: {}", et),
+            et => {
+                eprintln!("Invalid ethertype value! Got: {}", et);
+                EtherType::Arp
+            }
         }
     }
 
