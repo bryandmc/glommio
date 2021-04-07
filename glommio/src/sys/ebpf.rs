@@ -353,8 +353,8 @@ pub struct Umem {
 }
 
 impl Umem {
-    pub fn new(num_descriptors: u32, config: xsk_umem_config) -> Result<Umem> {
-        let mut memory_region = MemoryRegion::new(PAGE_SIZE * num_descriptors, false)?;
+    pub fn new(num_descriptors: u32, config: xsk_umem_config, huge_pages: bool) -> Result<Umem> {
+        let mut memory_region = MemoryRegion::new(PAGE_SIZE * num_descriptors, huge_pages)?;
         dbg!(&memory_region);
 
         let mem_ptr = unsafe { memory_region.as_mut_ptr() };
@@ -640,6 +640,79 @@ pub struct UmemConfig {
     pub frame_size: u32,
     pub frame_headroom: u32,
     pub flags: u32,
+}
+
+pub struct UmemBuilder {
+    fill_size: u32,
+    comp_size: u32,
+    frame_size: u32,
+    frame_headroom: u32,
+    flags: u32,
+    num_descriptors: u32,
+    use_huge_pages: bool,
+}
+
+impl UmemBuilder {
+    pub fn new(num_descriptors: u32) -> UmemBuilder {
+        UmemBuilder {
+            fill_size: XSK_RING_CONS__DEFAULT_NUM_DESCS,
+            comp_size: XSK_RING_PROD__DEFAULT_NUM_DESCS,
+            frame_size: XSK_UMEM__DEFAULT_FRAME_SIZE,
+            frame_headroom: XSK_UMEM__DEFAULT_FRAME_HEADROOM,
+            flags: XSK_UMEM__DEFAULT_FLAGS,
+            num_descriptors,
+            use_huge_pages: false,
+        }
+    }
+
+    pub fn fill_queue_size(self, fill_size: u32) -> Self {
+        UmemBuilder { fill_size, ..self }
+    }
+
+    pub fn completion_queue_size(self, comp_size: u32) -> Self {
+        UmemBuilder { comp_size, ..self }
+    }
+
+    pub fn frame_size(self, frame_size: u32) -> Self {
+        UmemBuilder { frame_size, ..self }
+    }
+
+    pub fn frame_headroom(self, frame_headroom: u32) -> Self {
+        UmemBuilder {
+            frame_headroom,
+            ..self
+        }
+    }
+
+    pub fn flags(self, flags: u32) -> Self {
+        UmemBuilder { flags, ..self }
+    }
+
+    pub fn use_huge_pages(self, use_huge_pages: bool) -> Self {
+        UmemBuilder {
+            use_huge_pages,
+            ..self
+        }
+    }
+
+    pub fn build(self) -> Result<Umem> {
+        let descriptors = self.num_descriptors;
+        let huge = self.use_huge_pages;
+        let config: UmemConfig = self.into();
+        Umem::new(descriptors, config.into(), huge)
+    }
+}
+
+impl From<UmemBuilder> for UmemConfig {
+    fn from(builder: UmemBuilder) -> Self {
+        UmemConfig {
+            fill_size: builder.fill_size,
+            comp_size: builder.comp_size,
+            frame_size: builder.frame_size,
+            frame_headroom: builder.frame_headroom,
+            flags: builder.flags,
+        }
+    }
 }
 
 impl From<UmemConfig> for xsk_umem_config {
@@ -1296,7 +1369,7 @@ pub(crate) mod tests {
     #[test]
     fn frame_buf_drop_requeue() {
         let umem = Rc::new(RefCell::new(
-            Umem::new(10, UmemConfig::default().into()).unwrap(),
+            Umem::new(10, UmemConfig::default().into(), false).unwrap(),
         ));
         let ptr = Rc::into_raw(umem);
 
@@ -1319,7 +1392,7 @@ pub(crate) mod tests {
     #[test]
     fn frame_buf_ip_header_csum() {
         let umem = Rc::new(RefCell::new(
-            Umem::new(10, UmemConfig::default().into()).unwrap(),
+            Umem::new(10, UmemConfig::default().into(), false).unwrap(),
         ));
         let mut fb = FrameBuf {
             inner: Rc::new(InnerBuf {
@@ -1343,7 +1416,11 @@ pub(crate) mod tests {
     #[cfg_attr(not(feature = "xdp"), ignore)]
     fn af_xdp_umem_produce_fill() -> Result<()> {
         let _guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
-        let umem = Rc::new(RefCell::new(Umem::new(10, UmemConfig::default().into())?));
+        let umem = Rc::new(RefCell::new(Umem::new(
+            10,
+            UmemConfig::default().into(),
+            false,
+        )?));
         dbg!(
             &umem,
             &umem.borrow().free_list,
@@ -1410,7 +1487,11 @@ pub(crate) mod tests {
     fn af_xdp_tx() -> Result<()> {
         let _guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
         let config = UmemConfig::default();
-        let umem = Rc::new(RefCell::new(Umem::new(NUM_DESCRIPTORS, config.into())?));
+        let umem = Rc::new(RefCell::new(Umem::new(
+            NUM_DESCRIPTORS,
+            config.into(),
+            false,
+        )?));
         let sock_config = XskSocketConfig::builder()
             .if_name("veth1")
             .queue(0)
@@ -1538,7 +1619,11 @@ pub(crate) mod tests {
     fn af_xdp_rx() -> Result<()> {
         let _guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
         let config = UmemConfig::default();
-        let umem = Rc::new(RefCell::new(Umem::new(NUM_DESCRIPTORS, config.into())?));
+        let umem = Rc::new(RefCell::new(Umem::new(
+            NUM_DESCRIPTORS,
+            config.into(),
+            false,
+        )?));
         let sock_config = XskSocketConfig::builder()
             .if_name("veth1")
             .queue(0)
@@ -1598,7 +1683,11 @@ pub(crate) mod tests {
     fn af_xdp_construct_xdp_socket() -> Result<()> {
         let _guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
         let config = UmemConfig::default();
-        let umem = Rc::new(RefCell::new(Umem::new(NUM_DESCRIPTORS, config.into())?));
+        let umem = Rc::new(RefCell::new(Umem::new(
+            NUM_DESCRIPTORS,
+            config.into(),
+            false,
+        )?));
         let sock_config = XskSocketConfig::builder()
             .if_name("veth1")
             .queue(0)
@@ -1626,8 +1715,13 @@ pub(crate) mod tests {
     #[cfg_attr(not(feature = "xdp"), ignore)]
     fn construct_umem() -> Result<()> {
         let _guard = XDP_LOCK.lock().unwrap_or_else(|x| x.into_inner());
-        let config = UmemConfig::default();
-        let umem = Umem::new(NUM_DESCRIPTORS, config.into())?;
+        dbg!(XSK_UMEM__DEFAULT_FLAGS);
+        let umem = UmemBuilder::new(1024)
+            .use_huge_pages(false)
+            .frame_headroom(0)
+            // .frame_size(XSK_UMEM__DEFAULT_FRAME_SIZE)
+            .flags(libbpf_sys::XSK_UMEM__DEFAULT_FLAGS)
+            .build()?;
         dbg!(umem);
 
         Ok(())

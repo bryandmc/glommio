@@ -7,7 +7,7 @@ use alloc::alloc::Layout;
 use log::warn;
 use nix::{
     fcntl::{FallocateFlags, OFlag},
-    poll::PollFlags,
+    poll::{PollFd, PollFlags},
 };
 use rlimit::Resource;
 use std::{
@@ -1221,6 +1221,12 @@ impl Reactor {
             _ => unreachable!(),
         };
         self.queue_standard_request(source, op);
+    }
+
+    /// TODO: unfinished
+    pub(crate) fn poll_sync(&self, source: &Source, options: PollFlags) {
+        // let fd = PollFd::new(fd, options);
+        // nix::poll::poll(&mut [fd], 1);
     }
 
     pub(crate) fn poll(&self, source: &Source, options: PollFlags) {

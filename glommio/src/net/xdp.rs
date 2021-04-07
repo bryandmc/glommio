@@ -173,6 +173,7 @@ pub struct XdpConfig {
     frame_headroom: u32,
     umem_flags: u32,
     pub(crate) umem_descriptors: u32,
+    pub(crate) use_huge_pages: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -190,6 +191,7 @@ pub struct XdpConfigBuilder {
     frame_headroom: u32,
     umem_flags: u32,
     umem_descriptors: u32,
+    use_huge_pages: bool,
 }
 
 impl XdpConfigBuilder {
@@ -274,6 +276,13 @@ impl XdpConfigBuilder {
         }
     }
 
+    pub const fn use_huge_pages(self, use_huge_pages: bool) -> XdpConfigBuilder {
+        XdpConfigBuilder {
+            use_huge_pages,
+            ..self
+        }
+    }
+
     pub fn build(self) -> XdpConfig {
         XdpConfig {
             if_name: self.if_name.expect("Interface name not provided!"),
@@ -289,6 +298,7 @@ impl XdpConfigBuilder {
             frame_headroom: self.frame_headroom,
             umem_flags: self.umem_flags,
             umem_descriptors: self.umem_descriptors,
+            use_huge_pages: self.use_huge_pages,
         }
     }
 }
@@ -309,6 +319,7 @@ impl XdpConfig {
             bind_flags: XskBindFlags::empty().bits(),
             libbpf_flags: 0,
             umem_descriptors: 1024,
+            use_huge_pages: false,
         }
     }
 }

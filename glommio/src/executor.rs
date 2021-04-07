@@ -46,15 +46,9 @@ use futures_lite::pin;
 use scoped_tls::scoped_thread_local;
 
 use crate::{
-    multitask,
-    parking,
-    sys,
+    multitask, parking, sys,
     task::{self, waker_fn::waker_fn},
-    GlommioError,
-    IoRequirements,
-    Latency,
-    Reactor,
-    Shares,
+    GlommioError, IoRequirements, Latency, Reactor, Shares,
 };
 #[cfg(feature = "xdp")]
 use crate::{net::xdp::XdpConfig, sys::ebpf};
@@ -674,7 +668,8 @@ impl LocalExecutor {
         preempt_timer: Duration,
     ) -> LocalExecutor {
         let p = parking::Parker::new();
-        let umem = ebpf::Umem::new(config.umem_descriptors, config.into()).unwrap();
+        let huge = config.use_huge_pages;
+        let umem = ebpf::Umem::new(config.umem_descriptors, config.into(), huge).unwrap();
         LocalExecutor {
             queues: ExecutorQueues::new(preempt_timer),
             parker: p,
@@ -1419,8 +1414,7 @@ mod test {
     use crate::{
         enclose,
         timer::{self, Timer},
-        Local,
-        SharesManager,
+        Local, SharesManager,
     };
     use core::mem::MaybeUninit;
     use futures::join;
