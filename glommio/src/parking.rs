@@ -56,8 +56,8 @@ use futures_lite::*;
 use crate::sys::ebpf;
 
 use crate::{
-    sys::{self, DirectIO, DmaBuffer, IOBuffer, PollableStatus, SleepNotifier, Source, SourceType},
-    GlommioError,
+    sys,
+    sys::{DirectIo, DmaBuffer, IoBuffer, PollableStatus, SleepNotifier, Source, SourceType},
     IoRequirements,
     Latency,
     Local,
@@ -370,7 +370,7 @@ impl Reactor {
         pos: u64,
         pollable: PollableStatus,
     ) -> Source {
-        let source = self.new_source(raw, SourceType::Write(pollable, IOBuffer::Dma(buf)));
+        let source = self.new_source(raw, SourceType::Write(pollable, IoBuffer::Dma(buf)));
         self.sys.write_dma(&source, pos);
         source
     }
@@ -379,8 +379,8 @@ impl Reactor {
         let source = self.new_source(
             raw,
             SourceType::Write(
-                PollableStatus::NonPollable(DirectIO::Disabled),
-                IOBuffer::Buffered(buf),
+                PollableStatus::NonPollable(DirectIo::Disabled),
+                IoBuffer::Buffered(buf),
             ),
         );
         self.sys.write_buffered(&source, pos);
@@ -540,7 +540,7 @@ impl Reactor {
     pub(crate) fn read_buffered(&self, raw: RawFd, pos: u64, size: usize) -> Source {
         let source = self.new_source(
             raw,
-            SourceType::Read(PollableStatus::NonPollable(DirectIO::Disabled), None),
+            SourceType::Read(PollableStatus::NonPollable(DirectIo::Disabled), None),
         );
         self.sys.read_buffered(&source, pos, size);
         source
@@ -639,7 +639,12 @@ impl Reactor {
 
     fn process_shared_channels(&self, wakers: &mut Vec<Waker>) -> usize {
         let mut channels = self.shared_channels.borrow_mut();
-        channels.process_shared_channels(wakers)
+        let mut processed = channels.process_shared_channels(wakers);
+        while let Some(w) = self.sys.foreign_notifiers() {
+            processed += 1;
+            wakers.push(w)
+        }
+        processed
     }
 
     fn rush_dispatch(&self, source: &Source) -> io::Result<()> {
@@ -686,6 +691,12 @@ impl Reactor {
         Ok(woke > 0)
     }
 
+    fn process_external_events(&self, wakers: &mut Vec<Waker>) -> Option<Duration> {
+        let next_timer = self.process_timers(wakers);
+        self.process_shared_channels(wakers);
+        next_timer
+    }
+
     /// Processes new events, blocking until the first event or the timeout.
     fn react(&self, timeout: Option<Duration>) -> io::Result<()> {
         // FIXME: use shrink_to here to bring the capacity back to
@@ -694,8 +705,7 @@ impl Reactor {
         let mut wakers = self.wakers.borrow_mut();
 
         // Process ready timers.
-        let next_timer = self.process_timers(&mut wakers);
-        self.process_shared_channels(&mut wakers);
+        let next_timer = self.process_external_events(&mut wakers);
 
         // Block on I/O events.
         let res = match self.sys.wait(&mut wakers, timeout, next_timer, |wakers| {
@@ -703,7 +713,7 @@ impl Reactor {
         }) {
             // Don't wait for the next loop to process timers or shared channels
             Ok(true) => {
-                self.process_timers(&mut wakers);
+                self.process_external_events(&mut wakers);
                 Ok(())
             }
 

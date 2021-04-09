@@ -30,7 +30,7 @@ use crate::{
     sys::{
         self,
         dma_buffer::{BufferStorage, DmaBuffer},
-        DirectIO, IOBuffer, InnerSource, PollableStatus, Source, SourceType,
+        DirectIo, InnerSource, IoBuffer, PollableStatus, Source, SourceType,
     },
     uring_sys, IoRequirements, Latency,
 };
@@ -200,7 +200,7 @@ fn check_supported_operations(ops: &[uring_sys::IoRingOp]) -> bool {
         if probe.is_null() {
             panic!(
                 "Failed to register a probe. The most likely reason is that your kernel witnessed \
-                 Romulus killing Remus (too old!!)"
+                 Romulus killing Remus (too old!! kernel should be at least 5.8)"
             );
         }
 
@@ -283,10 +283,10 @@ where
                 sqe.prep_read(op.fd, buf.as_bytes_mut(), pos);
 
                 let src = peek_source(from_user_data(op.user_data));
-                if let SourceType::Read(PollableStatus::NonPollable(DirectIO::Disabled), slot) =
+                if let SourceType::Read(PollableStatus::NonPollable(DirectIo::Disabled), slot) =
                     &mut *src.source_type.borrow_mut()
                 {
-                    *slot = Some(IOBuffer::Dma(buf));
+                    *slot = Some(IoBuffer::Dma(buf));
                 } else {
                     panic!("Expected Read source type");
                 };
@@ -340,9 +340,9 @@ where
                 let src = peek_source(from_user_data(op.user_data));
 
                 match &mut *src.source_type.borrow_mut() {
-                    SourceType::Read(PollableStatus::NonPollable(DirectIO::Disabled), slot) => {
+                    SourceType::Read(PollableStatus::NonPollable(DirectIo::Disabled), slot) => {
                         sqe.prep_read(op.fd, buf.as_bytes_mut(), pos);
-                        *slot = Some(IOBuffer::Dma(buf));
+                        *slot = Some(IoBuffer::Dma(buf));
                     }
                     SourceType::Read(_, slot) => {
                         match buf.uring_buffer_id() {
@@ -353,7 +353,7 @@ where
                                 sqe.prep_read_fixed(op.fd, buf.as_bytes_mut(), pos, idx);
                             }
                         };
-                        *slot = Some(IOBuffer::Dma(buf));
+                        *slot = Some(IoBuffer::Dma(buf));
                     }
                     _ => unreachable!(),
                 };
@@ -788,8 +788,8 @@ impl Source {
     pub(crate) fn extract_dma_buffer(&mut self) -> DmaBuffer {
         let stype = self.extract_source_type();
         match stype {
-            SourceType::Read(_, Some(IOBuffer::Dma(buffer))) => buffer,
-            SourceType::Write(_, IOBuffer::Dma(buffer)) => buffer,
+            SourceType::Read(_, Some(IoBuffer::Dma(buffer))) => buffer,
+            SourceType::Write(_, IoBuffer::Dma(buffer)) => buffer,
             x => panic!("Could not extract buffer. Source: {:?}", x),
         }
     }
@@ -797,8 +797,8 @@ impl Source {
     pub(crate) fn extract_buffer(&mut self) -> Vec<u8> {
         let stype = self.extract_source_type();
         match stype {
-            SourceType::Read(_, Some(IOBuffer::Buffered(buffer))) => buffer,
-            SourceType::Write(_, IOBuffer::Buffered(buffer)) => buffer,
+            SourceType::Read(_, Some(IoBuffer::Buffered(buffer))) => buffer,
+            SourceType::Write(_, IoBuffer::Buffered(buffer)) => buffer,
             x => panic!("Could not extract buffer. Source: {:?}", x),
         }
     }
@@ -1135,7 +1135,7 @@ impl Reactor {
         let eventfd_src = Source::new(
             IoRequirements::default(),
             notifier.eventfd_fd(),
-            SourceType::Read(PollableStatus::NonPollable(DirectIO::Disabled), None),
+            SourceType::Read(PollableStatus::NonPollable(DirectIo::Disabled), None),
         );
         assert_eq!(main_ring.install_eventfd(&eventfd_src), true);
 
@@ -1154,6 +1154,10 @@ impl Reactor {
         self.notifier.id()
     }
 
+    pub(crate) fn foreign_notifiers(&self) -> Option<core::task::Waker> {
+        self.notifier.get_foreign_notifier()
+    }
+
     pub(crate) fn alloc_dma_buffer(&self, size: usize) -> DmaBuffer {
         let mut poll_ring = self.poll_ring.borrow_mut();
         poll_ring.alloc_dma_buffer(size)
@@ -1162,10 +1166,10 @@ impl Reactor {
     pub(crate) fn write_dma(&self, source: &Source, pos: u64) {
         let op = match &*source.source_type() {
             SourceType::Write(
-                PollableStatus::NonPollable(DirectIO::Disabled),
-                IOBuffer::Dma(buf),
+                PollableStatus::NonPollable(DirectIo::Disabled),
+                IoBuffer::Dma(buf),
             ) => UringOpDescriptor::Write(buf.as_ptr(), buf.len(), pos),
-            SourceType::Write(_, IOBuffer::Dma(buf)) => match buf.uring_buffer_id() {
+            SourceType::Write(_, IoBuffer::Dma(buf)) => match buf.uring_buffer_id() {
                 Some(id) => UringOpDescriptor::WriteFixed(buf.as_ptr(), buf.len(), pos, id),
                 None => UringOpDescriptor::Write(buf.as_ptr(), buf.len(), pos),
             },
@@ -1177,8 +1181,8 @@ impl Reactor {
     pub(crate) fn write_buffered(&self, source: &Source, pos: u64) {
         let op = match &*source.source_type() {
             SourceType::Write(
-                PollableStatus::NonPollable(DirectIO::Disabled),
-                IOBuffer::Buffered(buf),
+                PollableStatus::NonPollable(DirectIo::Disabled),
+                IoBuffer::Buffered(buf),
             ) => UringOpDescriptor::Write(buf.as_ptr() as *const u8, buf.len(), pos),
             x => panic!("Unexpected source type for write: {:?}", x),
         };

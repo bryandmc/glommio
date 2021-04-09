@@ -443,7 +443,7 @@ impl<T> From<GlommioError<T>> for io::Error {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::io;
+    use std::{io, panic::panic_any};
 
     #[test]
     #[should_panic(
@@ -468,7 +468,7 @@ mod test {
             "Reading {} bytes from position {} would cross a buffer boundary (Buffer size {})",
             100, 90, 120
         ))));
-        panic!(err.unwrap_err().to_string());
+        panic_any(err.unwrap_err().to_string());
     }
 
     #[test]
@@ -478,28 +478,28 @@ mod test {
             "Some specific message here with value: {}",
             1001
         ))));
-        panic!(err.unwrap_err().to_string());
+        panic_any(err.unwrap_err().to_string());
     }
 
     #[test]
     #[should_panic(expected = "Queue #0 is still active")]
     fn queue_still_active_err_msg() {
         let err: Result<(), ()> = Err(GlommioError::queue_still_active(0));
-        panic!(err.unwrap_err().to_string());
+        panic_any(err.unwrap_err().to_string());
     }
 
     #[test]
     #[should_panic(expected = "Queue #0 is not found")]
     fn queue_not_found_err_msg() {
         let err: Result<(), ()> = Err(GlommioError::queue_not_found(0));
-        panic!(err.unwrap_err().to_string());
+        panic_any(err.unwrap_err().to_string());
     }
 
     #[test]
     #[should_panic(expected = "RwLock is closed")]
     fn rwlock_closed_err_msg() {
         let err: Result<(), ()> = Err(GlommioError::Closed(ResourceType::RwLock));
-        panic!(err.unwrap_err().to_string());
+        panic_any(err.unwrap_err().to_string());
     }
 
     #[test]
@@ -509,21 +509,21 @@ mod test {
             requested: 0,
             available: 0,
         }));
-        panic!(err.unwrap_err().to_string());
+        panic_any(err.unwrap_err().to_string());
     }
 
     #[test]
     #[should_panic(expected = "Channel is closed")]
     fn channel_closed_err_msg() {
         let err: Result<(), ()> = Err(GlommioError::Closed(ResourceType::Channel(())));
-        panic!(err.unwrap_err().to_string());
+        panic_any(err.unwrap_err().to_string());
     }
 
     #[test]
     #[should_panic(expected = "RwLock operation would block")]
     fn rwlock_wouldblock_err_msg() {
         let err: Result<(), ()> = Err(GlommioError::WouldBlock(ResourceType::RwLock));
-        panic!(err.unwrap_err().to_string());
+        panic_any(err.unwrap_err().to_string());
     }
 
     #[test]
@@ -533,14 +533,14 @@ mod test {
             requested: 0,
             available: 0,
         }));
-        panic!(err.unwrap_err().to_string());
+        panic_any(err.unwrap_err().to_string());
     }
 
     #[test]
     #[should_panic(expected = "Channel operation would block")]
     fn channel_wouldblock_err_msg() {
         let err: Result<(), ()> = Err(GlommioError::WouldBlock(ResourceType::Channel(())));
-        panic!(err.unwrap_err().to_string());
+        panic_any(err.unwrap_err().to_string());
     }
 
     #[test]
@@ -549,7 +549,7 @@ mod test {
         let err: Result<(), ()> = Err(GlommioError::WouldBlock(ResourceType::File(
             "specific error message here".to_string(),
         )));
-        panic!(err.unwrap_err().to_string());
+        panic_any(err.unwrap_err().to_string());
     }
 
     #[test]
