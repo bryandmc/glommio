@@ -214,9 +214,29 @@ fn cstr(path: &Path) -> io::Result<CString> {
     Ok(CString::new(path.as_os_str().as_bytes())?)
 }
 
+/// Log the current queue counts (producer/consumer) as well as the cached and
+/// real values.
+#[cfg(feature = "xdp")]
+#[macro_export]
+macro_rules! log_queue_counts {
+    ($q:expr, $t:literal) => {{
+        let (prod, cons) = unsafe { (*$q.producer, *$q.consumer) };
+        tracing::debug!(
+            "Queue '{}': Producer: {} ({}), Consumer: {} ({}).",
+            $t,
+            prod,
+            $q.cached_prod,
+            cons,
+            $q.cached_cons
+        );
+    }};
+}
+
 mod dma_buffer;
 #[cfg(feature = "xdp")]
-pub(crate) mod ebpf;
+pub(crate) mod umem;
+#[cfg(feature = "xdp")]
+pub(crate) mod xsk;
 
 pub(crate) mod sysfs;
 mod uring;

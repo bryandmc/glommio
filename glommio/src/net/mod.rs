@@ -97,8 +97,11 @@ mod tcp_socket;
 mod udp_socket;
 mod unix;
 
+// #[cfg(feature = "xdp")]
+// pub mod xdp;
+
 #[cfg(feature = "xdp")]
-pub mod xdp;
+mod udp_xsk;
 
 pub use self::{
     tcp_socket::{AcceptedTcpStream, TcpListener, TcpStream},

@@ -3,7 +3,8 @@
 
 use crate::{
     sys::ebpf::{FrameBuf, Umem, XdpFlags, XskBindFlags, XskSocketConfig, XskSocketDriver},
-    GlommioError, Local,
+    GlommioError,
+    Local,
 };
 use nix::poll::PollFlags;
 use std::{cell::RefCell, rc::Rc};

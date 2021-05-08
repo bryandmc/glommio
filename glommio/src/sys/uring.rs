@@ -461,9 +461,7 @@ where
         }
 
         let src = consume_source(from_user_data(value.user_data()));
-
         let result = value.result();
-
         if try_process(&*src).is_none() {
             let mut w = src.wakers.borrow_mut();
             w.result = Some(transmute_error(result));
@@ -1227,13 +1225,7 @@ impl Reactor {
         self.queue_standard_request(source, op);
     }
 
-    /// TODO: unfinished
-    pub(crate) fn poll_sync(&self, source: &Source, options: PollFlags) {
-        // let fd = PollFd::new(fd, options);
-        // nix::poll::poll(&mut [fd], 1);
-    }
-
-    pub(crate) fn poll(&self, source: &Source, options: PollFlags) {
+    pub(crate) fn xsk_poll(&self, source: &Source, options: PollFlags) {
         let op = UringOpDescriptor::PollAdd(options);
         self.queue_standard_request(source, op);
     }

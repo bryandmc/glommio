@@ -10,8 +10,6 @@
 
 use std::ptr;
 
-#[cfg(feature = "xdp")]
-use super::ebpf;
 use crate::sys::uring::UringBuffer;
 use alloc::alloc::Layout;
 
@@ -50,9 +48,6 @@ impl Drop for SysAlloc {
 pub(crate) enum BufferStorage {
     Sys(SysAlloc),
     Uring(UringBuffer),
-
-    #[cfg(feature = "xdp")]
-    Umem(UmemBuffer),
 }
 
 impl BufferStorage {
@@ -60,9 +55,6 @@ impl BufferStorage {
         match self {
             BufferStorage::Sys(x) => x.as_ptr(),
             BufferStorage::Uring(x) => x.as_ptr(),
-
-            #[cfg(feature = "xdp")]
-            BufferStorage::Umem(x) => x.as_ptr(),
         }
     }
 
@@ -70,9 +62,6 @@ impl BufferStorage {
         match self {
             BufferStorage::Sys(x) => x.as_mut_ptr(),
             BufferStorage::Uring(x) => x.as_mut_ptr(),
-
-            #[cfg(feature = "xdp")]
-            BufferStorage::Umem(x) => x.as_mut_ptr(),
         }
     }
 }
@@ -176,57 +165,5 @@ impl AsMut<[u8]> for DmaBuffer {
     #[inline(always)]
     fn as_mut(&mut self) -> &mut [u8] {
         self.as_bytes_mut()
-    }
-}
-
-#[cfg(feature = "xdp")]
-use umem::UmemBuffer;
-
-#[cfg(feature = "xdp")]
-mod umem {
-    use std::{borrow::BorrowMut, cell::RefCell, collections::VecDeque, convert::TryInto, rc::Rc};
-
-    use super::*;
-
-    #[derive(Debug)]
-    pub(crate) struct UmemBuffer {
-        data: ptr::NonNull<u8>,
-        len: u32,
-        alloc: Rc<UmemAllocator>,
-    }
-
-    impl UmemBuffer {
-        pub(crate) fn new(
-            data: ptr::NonNull<u8>,
-            len: u32,
-            alloc: Rc<UmemAllocator>,
-        ) -> UmemBuffer {
-            UmemBuffer { data, len, alloc }
-        }
-        pub(crate) fn as_ptr(&self) -> *const u8 {
-            self.data.as_ptr() as _
-        }
-        pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
-            self.data.as_ptr() as _
-        }
-    }
-
-    #[derive(Debug)]
-    pub struct UmemAllocator {
-        pub(crate) free: RefCell<VecDeque<ebpf::FrameRef>>,
-        pub(crate) umem: Rc<ebpf::Umem>,
-    }
-
-    /// TODO: unfinished
-    impl UmemAllocator {
-        pub(crate) fn alloc(alloc: Rc<UmemAllocator>) -> Option<UmemBuffer> {
-            let frame = match alloc.free.borrow_mut().pop_front() {
-                Some(frame) => frame,
-                None => {
-                    return None;
-                }
-            };
-            None
-        }
     }
 }

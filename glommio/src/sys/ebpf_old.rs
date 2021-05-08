@@ -14,6 +14,7 @@ use std::{
     convert::TryInto,
     ffi::CString,
     io,
+    marker::PhantomData,
     mem::ManuallyDrop,
     net::Ipv4Addr,
     ops::{self, Index, IndexMut},
@@ -24,13 +25,22 @@ use std::{
 };
 
 use libbpf_sys::{
-    xsk_ring_cons, xsk_ring_prod, xsk_socket, xsk_socket_config, xsk_umem, xsk_umem_config,
-    XDP_FLAGS_UPDATE_IF_NOEXIST, XDP_USE_NEED_WAKEUP, XSK_RING_CONS__DEFAULT_NUM_DESCS,
-    XSK_RING_PROD__DEFAULT_NUM_DESCS, XSK_UMEM__DEFAULT_FLAGS, XSK_UMEM__DEFAULT_FRAME_HEADROOM,
+    xsk_ring_cons,
+    xsk_ring_prod,
+    xsk_socket,
+    xsk_socket_config,
+    xsk_umem,
+    xsk_umem_config,
+    XDP_FLAGS_UPDATE_IF_NOEXIST,
+    XDP_USE_NEED_WAKEUP,
+    XSK_RING_CONS__DEFAULT_NUM_DESCS,
+    XSK_RING_PROD__DEFAULT_NUM_DESCS,
+    XSK_UMEM__DEFAULT_FLAGS,
+    XSK_UMEM__DEFAULT_FRAME_HEADROOM,
     XSK_UMEM__DEFAULT_FRAME_SIZE,
 };
 
-use crate::{log_queue_counts, parking::Reactor, GlommioError, Local};
+use crate::{parking::Reactor, GlommioError, Local};
 
 use super::Source;
 
@@ -159,7 +169,7 @@ impl XskSocketDriver {
     }
 
     pub(crate) fn consume_rx_owned(&mut self, batch: u64) -> Vec<FrameRef> {
-        log_queue_counts!(self.rx_queue, "RX");
+        // log_queue_counts!(self.rx_queue, "RX");
         let mut idx = 0;
         let mut recv_descriptors = vec![];
 
@@ -214,7 +224,7 @@ impl XskSocketDriver {
         &mut self,
         descriptors: &mut Vec<FrameBuf>,
     ) -> (usize, Option<Vec<Option<Source>>>) {
-        log_queue_counts!(self.tx_queue, "TX");
+        // log_queue_counts!(self.tx_queue, "TX");
 
         let nb = descriptors.len().try_into().unwrap();
         if nb == 0 {
@@ -499,7 +509,7 @@ impl Umem {
     }
 
     pub(crate) fn consume_completions_queue(&mut self, size_hint: u64) -> usize {
-        log_queue_counts!(self.completion_queue, "COMPLETION");
+        // log_queue_counts!(self.completion_queue, "COMPLETION");
         let nb = self.pending_completions.len() as u64;
         let mut idx = 0;
         let count = unsafe {
@@ -551,7 +561,7 @@ impl Umem {
     }
 
     pub(crate) fn fill_descriptors(&mut self, mut amt: usize) -> usize {
-        log_queue_counts!(self.fill_queue, "FILL");
+        // log_queue_counts!(self.fill_queue, "FILL");
         println!("Going to attempt to fill {} descriptors..", amt);
         let mut idx = 0;
         let count = loop {
@@ -640,6 +650,8 @@ pub struct UmemConfig {
     pub frame_size: u32,
     pub frame_headroom: u32,
     pub flags: u32,
+    pub num_descriptors: u32,
+    pub use_huge_pages: bool,
 }
 
 pub struct UmemBuilder {
@@ -711,6 +723,8 @@ impl From<UmemBuilder> for UmemConfig {
             frame_size: builder.frame_size,
             frame_headroom: builder.frame_headroom,
             flags: builder.flags,
+            num_descriptors: XSK_RING_CONS__DEFAULT_NUM_DESCS * 2,
+            use_huge_pages: false,
         }
     }
 }
@@ -735,6 +749,8 @@ impl Default for UmemConfig {
             frame_size: XSK_UMEM__DEFAULT_FRAME_SIZE,
             frame_headroom: XSK_UMEM__DEFAULT_FRAME_HEADROOM,
             flags: XSK_UMEM__DEFAULT_FLAGS,
+            num_descriptors: XSK_RING_CONS__DEFAULT_NUM_DESCS * 2,
+            use_huge_pages: false,
         }
     }
 }

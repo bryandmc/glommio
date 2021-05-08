@@ -24,7 +24,10 @@
 //! those tasks on the same thread, no thread context switch is necessary when
 //! going between task execution and I/O.
 
-use crate::iou::sqe::SockAddrStorage;
+use crate::{
+    iou::sqe::SockAddrStorage,
+    sys::{umem::Umem, xsk},
+};
 use ahash::AHashMap;
 use log::error;
 use nix::{
@@ -32,12 +35,11 @@ use nix::{
     sys::socket::{MsgFlags, SockAddr},
 };
 use std::{
-    cell::{Cell, RefCell},
+    borrow::BorrowMut,
+    cell::{Cell, RefCell, RefMut},
     collections::{BTreeMap, VecDeque},
     ffi::CString,
-    fmt,
-    io,
-    mem,
+    fmt, io, mem,
     os::unix::{ffi::OsStrExt, io::RawFd},
     panic::{self, RefUnwindSafe, UnwindSafe},
     path::Path,
@@ -52,15 +54,10 @@ use std::{
 
 use futures_lite::*;
 
-#[cfg(feature = "xdp")]
-use crate::sys::ebpf;
-
 use crate::{
     sys,
     sys::{DirectIo, DmaBuffer, IoBuffer, PollableStatus, SleepNotifier, Source, SourceType},
-    IoRequirements,
-    Latency,
-    Local,
+    IoRequirements, Latency, Local,
 };
 
 /// Waits for a notification.
@@ -68,8 +65,18 @@ pub(crate) struct Parker {
     inner: Rc<Inner>,
 }
 
+const FILL_LOW_WATER_LINE: usize = 200;
+
 impl UnwindSafe for Parker {}
 impl RefUnwindSafe for Parker {}
+
+pub(crate) struct XskRingTick {
+    queue: xsk::QueueId,
+    filled: usize,
+    rx: usize,
+    tx: usize,
+    completion: usize,
+}
 
 impl Parker {
     /// Creates a new parker.
@@ -244,7 +251,7 @@ impl SharedChannels {
 /// There is only one global instance of this type, accessible by
 /// [`Local::get_reactor()`].
 pub(crate) struct Reactor {
-    /// Raw bindings to epoll/kqueue/wepoll.
+    /// Lower level io-uring functions and rings.
     pub(crate) sys: sys::Reactor,
 
     timers: RefCell<Timers>,
@@ -269,16 +276,27 @@ pub(crate) struct Reactor {
     preempt_ptr_head: *const u32,
     preempt_ptr_tail: *const AtomicU32,
 
+    /// This is annoying.. Might need a better way than this to allow for there
+    /// to "maybe" be a umem.. It might get annoying to have to constantly
+    /// unwrap/drill into this option to get at the umem.
     #[cfg(feature = "xdp")]
-    pub(crate) xdp_umem: Rc<RefCell<ebpf::Umem>>,
+    pub(crate) umem: Option<Rc<RefCell<Umem<'static>>>>,
+
+    #[cfg(feature = "xdp")]
+    pub(crate) xsk_sockets: AHashMap<xsk::QueueId, Rc<RefCell<xsk::XskSocketDriver<'static>>>>,
 }
 
 impl Reactor {
     #[cfg(feature = "xdp")]
-    pub(crate) fn new(notifier: Arc<SleepNotifier>, io_memory: usize, umem: ebpf::Umem) -> Reactor {
+    pub(crate) fn new(
+        notifier: Arc<SleepNotifier>,
+        io_memory: usize,
+        umem: Option<Umem<'static>>,
+    ) -> Reactor {
         let sys = sys::Reactor::new(notifier, io_memory)
             .expect("cannot initialize I/O event notification");
         let (preempt_ptr_head, preempt_ptr_tail) = sys.preempt_pointers();
+        let actual_umem = umem.map(|inner| Rc::new(RefCell::new(inner)));
         Reactor {
             sys,
             timers: RefCell::new(Timers::new()),
@@ -287,7 +305,8 @@ impl Reactor {
             wakers: RefCell::new(Vec::with_capacity(256)),
             preempt_ptr_head,
             preempt_ptr_tail: preempt_ptr_tail as _,
-            xdp_umem: Rc::new(RefCell::new(umem)),
+            umem: actual_umem,
+            xsk_sockets: AHashMap::new(),
         }
     }
 
@@ -455,10 +474,11 @@ impl Reactor {
         Ok(source)
     }
 
-    pub(crate) fn poll(&self, fd: RawFd, flags: PollFlags) -> Source {
+    pub(crate) fn xsk_poll(&self, fd: RawFd, flags: PollFlags) -> io::Result<Source> {
         let source = self.new_source(fd, SourceType::XskPoll);
-        self.sys.poll(&source, flags);
-        source
+        self.sys.xsk_poll(&source, flags);
+        self.rush_dispatch(&source)?;
+        Ok(source)
     }
 
     pub(crate) fn kick_tx(&self, fd: RawFd) -> Source {
@@ -674,13 +694,16 @@ impl Reactor {
         self.process_shared_channels(&mut wakers);
 
         if cfg!(feature = "xdp") {
-            #[cfg(feature = "xdp")]
-            {
-                let mut umem = self.xdp_umem.borrow_mut();
-                umem.maybe_consume_completions();
-                umem.maybe_fill_descriptors();
-            }
+            let results = self.process_xsk_rings(&mut wakers);
         }
+        // if cfg!(feature = "xdp") {
+        //     #[cfg(feature = "xdp")]
+        //     {
+        //         let mut umem = self.xdp_umem.borrow_mut();
+        //         umem.maybe_consume_completions();
+        //         umem.maybe_fill_descriptors();
+        //     }
+        // }
         // println!("FINISHED borrowed ..");
 
         let woke = wakers.len();
@@ -697,6 +720,59 @@ impl Reactor {
         next_timer
     }
 
+    fn process_one_xsk_socket(
+        &self,
+        xsk: &RefCell<xsk::XskSocketDriver<'_>>,
+    ) -> crate::Result<(usize, usize, usize), ()> {
+        let mut xsk_ref = xsk.borrow_mut();
+        let packets = xsk_ref.consume_rx();
+        let mut TX_PLACEHOLDER = vec![];
+        let sent = xsk_ref.produce_tx(&mut TX_PLACEHOLDER);
+        if xsk_ref.tx_needs_wakeup() {
+            // Produce pending TX
+            let sent = xsk_ref.produce_tx(&mut TX_PLACEHOLDER);
+        };
+        let mut accumulator = 0;
+        while xsk_ref.completions() > 0 {
+            accumulator += xsk_ref.consume_completions()?;
+        }
+        Ok((packets.len(), sent, accumulator))
+    }
+
+    /// TODO: Pick up from here ..
+    ///
+    /// 1.) Is this the right place for this stuff?
+    /// 2.) Are we allocating too much for various containers to shuffle stuff
+    /// around?
+    /// 3.) Start by starting from the user-facing portion and working the
+    /// connective tissue back towards these root, synchronous implementations.
+    fn process_xsk_rings(&self, wakers: &mut Vec<Waker>) -> crate::Result<Vec<XskRingTick>, ()> {
+        let mut filled = 0;
+        if let Some(ref umem) = self.umem {
+            let c = umem.clone();
+            let mut umem_ref = (*c).borrow_mut();
+            if umem_ref.fill_count() < FILL_LOW_WATER_LINE {
+                filled = umem_ref.fill_frames(200);
+            }
+        }
+        let mut processing_manifest = vec![];
+        // for waker in wakers {
+        //     waker.wake_by_ref();
+        // }
+        for (queue, xsk) in self.xsk_sockets.iter() {
+            let (rx, tx, completion) = self.process_one_xsk_socket(xsk)?;
+            processing_manifest.push(XskRingTick {
+                queue: *queue,
+                filled,
+                rx,
+                tx,
+                completion,
+            })
+        }
+
+        Ok(processing_manifest)
+    }
+
     /// Processes new events, blocking until the first event or the timeout.
     fn react(&self, timeout: Option<Duration>) -> io::Result<()> {
         // FIXME: use shrink_to here to bring the capacity back to
@@ -707,6 +783,9 @@ impl Reactor {
         // Process ready timers.
         let next_timer = self.process_external_events(&mut wakers);
 
+        if cfg!(feature = "xdp") {
+            let closure = |wakers| self.process_xsk_rings(wakers);
+        }
         // Block on I/O events.
         let res = match self.sys.wait(&mut wakers, timeout, next_timer, |wakers| {
             self.process_shared_channels(wakers)

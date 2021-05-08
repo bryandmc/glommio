@@ -46,12 +46,18 @@ use futures_lite::pin;
 use scoped_tls::scoped_thread_local;
 
 use crate::{
-    multitask, parking, sys,
+    multitask,
+    parking,
+    sys::{self, umem},
     task::{self, waker_fn::waker_fn},
-    GlommioError, IoRequirements, Latency, Reactor, Shares,
+    GlommioError,
+    IoRequirements,
+    Latency,
+    Reactor,
+    Shares,
 };
-#[cfg(feature = "xdp")]
-use crate::{net::xdp::XdpConfig, sys::ebpf};
+// #[cfg(feature = "xdp")]
+// use crate::{net::xdp::XdpConfig, sys::ebpf};
 use ahash::AHashMap;
 
 /// Result type alias that removes the need to specify a type parameter
@@ -403,8 +409,9 @@ pub struct LocalExecutorBuilder {
     io_memory: usize,
     /// How often to yield to other task queues
     preempt_timer_duration: Duration,
+
     #[cfg(feature = "xdp")]
-    xdp_config: Option<XdpConfig>,
+    umem_config: Option<umem::UmemBuilder>,
 }
 
 impl LocalExecutorBuilder {
@@ -417,8 +424,9 @@ impl LocalExecutorBuilder {
             name: String::from("unnamed"),
             io_memory: 10 << 20,
             preempt_timer_duration: Duration::from_millis(100),
+
             #[cfg(feature = "xdp")]
-            xdp_config: None,
+            umem_config: None,
         }
     }
 
@@ -454,11 +462,11 @@ impl LocalExecutorBuilder {
     }
 
     /// Xdp configuration.
-    #[cfg(feature = "xdp")]
-    pub fn xdp_config(mut self, config: XdpConfig) -> LocalExecutorBuilder {
-        self.xdp_config = Some(config);
-        self
-    }
+    // #[cfg(feature = "xdp")]
+    // pub fn xdp_config(mut self, config: XdpConfig) -> LocalExecutorBuilder {
+    //     self.xdp_config = Some(config);
+    //     self
+    // }
 
     /// How often [`need_preempt`] will return true by default.
     ///
@@ -492,8 +500,7 @@ impl LocalExecutorBuilder {
         let mut le = LocalExecutor::new(
             notifier,
             self.io_memory,
-            self.xdp_config
-                .expect("ERROR must create XDP config in executor builder before using it."),
+            self.umem_config,
             self.preempt_timer_duration,
         );
 
@@ -571,7 +578,7 @@ impl LocalExecutorBuilder {
                 let mut le = LocalExecutor::new(
                     notifier,
                     self.io_memory,
-                    self.xdp_config.unwrap(),
+                    self.umem_config,
                     self.preempt_timer_duration,
                 );
 
@@ -669,12 +676,11 @@ impl LocalExecutor {
     fn new(
         notifier: Arc<sys::SleepNotifier>,
         io_memory: usize,
-        config: XdpConfig,
+        config: Option<umem::UmemBuilder>,
         preempt_timer: Duration,
     ) -> LocalExecutor {
         let p = parking::Parker::new();
-        let huge = config.use_huge_pages;
-        let umem = ebpf::Umem::new(config.umem_descriptors, config.into(), huge).unwrap();
+        let umem = config.map(|inner| inner.build().unwrap());
         LocalExecutor {
             queues: ExecutorQueues::new(preempt_timer),
             parker: p,
@@ -1422,7 +1428,8 @@ mod test {
     use crate::{
         enclose,
         timer::{self, sleep, Timer},
-        Local, SharesManager,
+        Local,
+        SharesManager,
     };
     use core::mem::MaybeUninit;
     use futures::join;
