@@ -3,7 +3,7 @@
 //
 // This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //
-use crate::{iou::sqe::SockAddrStorage, uring_sys};
+use crate::{iou::sqe::SockAddrStorage, uring_sys, RingIoStats, TaskQueueHandle};
 use ahash::AHashMap;
 use lockfree::channel::mpsc;
 use log::debug;
@@ -512,6 +512,8 @@ impl Wakers {
     }
 }
 
+pub(crate) type StatsCollectionFn = fn(&io::Result<usize>, &mut RingIoStats) -> ();
+
 /// A registered source of I/O events.
 pub struct InnerSource {
     /// Raw file descriptor on Unix platforms.
@@ -527,6 +529,10 @@ pub struct InnerSource {
     timeout: RefCell<Option<TimeSpec64>>,
 
     enqueued: Cell<Option<EnqueuedSource>>,
+
+    stats_collection: Option<StatsCollectionFn>,
+
+    task_queue: Option<TaskQueueHandle>,
 }
 
 pub struct EnqueuedSource {
@@ -552,7 +558,13 @@ pub struct Source {
 
 impl Source {
     /// Registers an I/O source in the reactor.
-    pub(crate) fn new(ioreq: IoRequirements, raw: RawFd, source_type: SourceType) -> Source {
+    pub(crate) fn new(
+        ioreq: IoRequirements,
+        raw: RawFd,
+        source_type: SourceType,
+        stats_collection_fn: Option<StatsCollectionFn>,
+        task_queue: Option<TaskQueueHandle>,
+    ) -> Source {
         Source {
             inner: Rc::new(InnerSource {
                 raw,
@@ -561,6 +573,8 @@ impl Source {
                 io_requirements: ioreq,
                 enqueued: Cell::new(None),
                 timeout: RefCell::new(None),
+                stats_collection: stats_collection_fn,
+                task_queue,
             }),
         }
     }

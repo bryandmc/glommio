@@ -29,14 +29,14 @@ pub trait Handler<T>: Clone {
 }
 
 /// The public interface for sharding
-pub struct Sharded<T: Send + Copy, H> {
+pub struct Sharded<T: Send, H> {
     shard: Rc<Shard<T, H>>,
     consumers: Vec<JoinHandle<()>>,
     forward_tasks: Vec<JoinHandle<()>>,
     closed: bool,
 }
 
-impl<T: Send + Copy, H> Debug for Sharded<T, H> {
+impl<T: Send, H> Debug for Sharded<T, H> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "Sharded")
     }
@@ -45,7 +45,7 @@ impl<T: Send + Copy, H> Debug for Sharded<T, H> {
 /// Alias for sharding function
 pub type ShardFn<T> = fn(&T, usize) -> usize;
 
-impl<T: Send + Copy + 'static, H: Handler<T> + 'static> Sharded<T, H> {
+impl<T: Send + 'static, H: Handler<T> + 'static> Sharded<T, H> {
     /// Join a full mesh for sharding
     pub async fn new(mesh: FullMesh<T>, shard_fn: ShardFn<T>, handler: H) -> Result<Self, ()> {
         let nr_shards = mesh.nr_peers();
@@ -78,6 +78,11 @@ impl<T: Send + Copy + 'static, H: Handler<T> + 'static> Sharded<T, H> {
             forward_tasks,
             closed: false,
         })
+    }
+
+    /// Returns the total number of shards
+    pub fn nr_shards(&self) -> usize {
+        self.shard.nr_shards
     }
 
     /// Returns the shard_id associated with ourselves
@@ -124,7 +129,7 @@ impl<T: Send + Copy + 'static, H: Handler<T> + 'static> Sharded<T, H> {
     /// closed.
     ///
     /// [`GlommioError::Closed`]: crate::GlommioError::Closed
-    pub async fn send(&mut self, message: T) -> Result<(), T> {
+    pub async fn send(&self, message: T) -> Result<(), T> {
         self.shard.send(message).await
     }
 
@@ -146,7 +151,7 @@ impl<T: Send + Copy + 'static, H: Handler<T> + 'static> Sharded<T, H> {
     }
 }
 
-struct Shard<T: Send + Copy, H> {
+struct Shard<T: Send, H> {
     nr_shards: usize,
     shard_id: usize,
     shard_fn: ShardFn<T>,
@@ -154,7 +159,7 @@ struct Shard<T: Send + Copy, H> {
     handler: H,
 }
 
-impl<T: Send + Copy + 'static, H: Handler<T> + 'static> Shard<T, H> {
+impl<T: Send + 'static, H: Handler<T> + 'static> Shard<T, H> {
     async fn handle<S: Stream<Item = T> + Unpin>(&self, mut messages: S) {
         while let Some(msg) = messages.next().await {
             self.send(msg).await.unwrap();
