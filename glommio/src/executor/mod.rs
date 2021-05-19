@@ -48,9 +48,12 @@ use std::{
 use futures_lite::pin;
 use scoped_tls::scoped_thread_local;
 
+#[cfg(feature = "xdp")]
+use crate::sys::umem;
+
 use crate::{
     parking,
-    sys::{self, umem},
+    sys,
     task::{self, waker_fn::waker_fn},
     GlommioError,
     IoRequirements,
@@ -818,6 +821,10 @@ impl LocalExecutorPoolBuilder {
                     let fut_gen = fut_gen.clone();
 
                     move || {
+                        #[cfg(feature = "xdp")]
+                        let mut le =
+                            LocalExecutor::new(notifier, io_memory, None, preempt_timer_duration);
+                        #[cfg(not(feature = "xdp"))]
                         let mut le =
                             LocalExecutor::new(notifier, io_memory, preempt_timer_duration);
                         if let CpuSet(Some(set)) = cpu_set {

@@ -24,10 +24,9 @@
 //! those tasks on the same thread, no thread context switch is necessary when
 //! going between task execution and I/O.
 
-use crate::{
-    iou::sqe::SockAddrStorage,
-    sys::{umem::Umem, xsk},
-};
+use crate::iou::sqe::SockAddrStorage;
+#[cfg(feature = "xdp")]
+use crate::sys::{umem::Umem, xsk};
 use ahash::AHashMap;
 use nix::sys::socket::{MsgFlags, SockAddr};
 use std::{
@@ -35,7 +34,9 @@ use std::{
     cell::{Cell, RefCell, RefMut},
     collections::{BTreeMap, VecDeque},
     ffi::CString,
-    fmt, io, mem,
+    fmt,
+    io,
+    mem,
     os::unix::{ffi::OsStrExt, io::RawFd},
     panic::{self, RefUnwindSafe, UnwindSafe},
     path::Path,
@@ -53,10 +54,20 @@ use futures_lite::*;
 use crate::{
     sys,
     sys::{
-        DirectIo, DmaBuffer, IoBuffer, PollableStatus, SleepNotifier, Source, SourceType,
+        DirectIo,
+        DmaBuffer,
+        IoBuffer,
+        PollableStatus,
+        SleepNotifier,
+        Source,
+        SourceType,
         StatsCollectionFn,
     },
-    IoRequirements, IoStats, Latency, Local, TaskQueueHandle,
+    IoRequirements,
+    IoStats,
+    Latency,
+    Local,
+    TaskQueueHandle,
 };
 
 /// Waits for a notification.
@@ -69,6 +80,7 @@ const FILL_LOW_WATER_LINE: usize = 200;
 impl UnwindSafe for Parker {}
 impl RefUnwindSafe for Parker {}
 
+#[cfg(feature = "xdp")]
 pub(crate) struct XskRingTick {
     queue: xsk::QueueId,
     filled: usize,
@@ -284,6 +296,7 @@ pub(crate) struct Reactor {
     #[cfg(feature = "xdp")]
     pub(crate) umem: Option<Rc<RefCell<Umem<'static>>>>,
 
+    /// TODO: unsure this is where this will live..
     #[cfg(feature = "xdp")]
     pub(crate) xsk_sockets: AHashMap<xsk::QueueId, Rc<RefCell<xsk::XskSocketDriver<'static>>>>,
 }
@@ -304,7 +317,6 @@ impl Reactor {
             timers: RefCell::new(Timers::new()),
             shared_channels: RefCell::new(SharedChannels::new()),
             current_io_requirements: Cell::new(IoRequirements::default()),
-            wakers: RefCell::new(Vec::with_capacity(256)),
             preempt_ptr_head,
             preempt_ptr_tail: preempt_ptr_tail as _,
             umem: actual_umem,
@@ -509,15 +521,17 @@ impl Reactor {
         Ok(source)
     }
 
-    pub(crate) fn xsk_poll(&self, fd: RawFd, flags: PollFlags) -> io::Result<Source> {
-        let source = self.new_source(fd, SourceType::XskPoll);
+    #[cfg(feature = "xdp")]
+    pub(crate) fn xsk_poll(&self, fd: RawFd, flags: nix::poll::PollFlags) -> io::Result<Source> {
+        let source = self.new_source(fd, SourceType::XskPoll, None);
         self.sys.xsk_poll(&source, flags);
         self.rush_dispatch(&source)?;
         Ok(source)
     }
 
+    #[cfg(feature = "xdp")]
     pub(crate) fn kick_tx(&self, fd: RawFd) -> Source {
-        let source = self.new_source(fd, SourceType::XskKickTx);
+        let source = self.new_source(fd, SourceType::XskKickTx, None);
         self.sys.kick_tx(&source);
         source
     }
@@ -751,7 +765,7 @@ impl Reactor {
         self.sys
             .rush_dispatch(Some(Latency::NotImportant), &mut woke)?;
         self.sys.rush_dispatch(None, &mut woke)?;
-
+        #[cfg(feature = "xdp")]
         self.process_xsk_rings(&mut woke)?;
 
         woke += self.process_timers().1;
@@ -766,6 +780,7 @@ impl Reactor {
         (next_timer, woke)
     }
 
+    #[cfg(feature = "xdp")]
     fn process_one_xsk_socket(
         &self,
         xsk: &RefCell<xsk::XskSocketDriver<'_>>,
@@ -792,7 +807,8 @@ impl Reactor {
     /// around?
     /// 3.) Start by starting from the user-facing portion and working the
     /// connective tissue back towards these root, synchronous implementations.
-    fn process_xsk_rings(&self, wakers: &mut Vec<Waker>) -> crate::Result<Vec<XskRingTick>, ()> {
+    #[cfg(feature = "xdp")]
+    fn process_xsk_rings(&self, wakers: &mut usize) -> crate::Result<Vec<XskRingTick>, ()> {
         let mut filled = 0;
         if let Some(ref umem) = self.umem {
             let c = umem.clone();
@@ -822,6 +838,7 @@ impl Reactor {
         let (next_timer, woke) = self.process_external_events();
 
         if cfg!(feature = "xdp") {
+            #[cfg(feature = "xdp")]
             let closure = |wakers| self.process_xsk_rings(wakers);
         }
         // Block on I/O events.

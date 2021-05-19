@@ -1,0 +1,32 @@
+struct socket_wq {
+  unsigned long	flags;
+};
+
+struct socket {
+  unsigned int state;
+  short type;
+  unsigned long flags;
+  struct file *file;
+  struct sock	*sk;
+  const struct proto_ops *ops;
+  struct socket_wq wq;
+};
+
+kprobe:xsk_poll
+{
+  @arg = reg("di");
+  @arg2 = reg("si");
+  @sockstate = ((struct socket *)@arg2)->state;
+  @sockstate_name = "SS_FREE";
+  if (@sockstate == 0x1) {
+    @sockstate_name = "SS_UNCONNECTED";
+  } else if (@sockstate == 0x2) {
+    @sockstate_name = "SS_CONNECTING";
+  } else if (@sockstate == 0x3) {
+    @sockstate_name = "SS_CONNECTED";
+  } else if (@sockstate == 0x4) {
+    @sockstate_name = "SS_DISCONNECTING";
+  }
+  printf("[%s(%d)] socket state[%s]: %s \nkstack: %s ustack: %s \n",
+         comm, pid, ksym(@arg2), @sockstate_name, kstack, ustack);
+}

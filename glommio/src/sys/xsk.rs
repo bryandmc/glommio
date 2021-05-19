@@ -5,17 +5,22 @@ use std::{
     convert::TryInto,
     ffi::CString,
     io, mem,
-    net::ToSocketAddrs,
+    net::{SocketAddr, ToSocketAddrs},
     os::unix::prelude::{IntoRawFd, RawFd},
     ptr,
     rc::{Rc, Weak},
     sync::atomic::AtomicPtr,
+    time::Duration,
 };
 
-use crate::{parking, Local};
+use crate::{executor::TaskQueue, parking, IoRequirements, Latency, Local, TaskQueueHandle};
 use bitflags::bitflags;
 
-use super::umem::{self, Umem};
+use super::{
+    add_source, to_user_data,
+    umem::{self, Umem},
+    Source, SourceType,
+};
 
 use crate::GlommioError;
 
@@ -279,7 +284,22 @@ impl<'umem> XskSocketDriver<'umem> {
         self.umem.borrow().completions()
     }
 
-    pub(crate) fn bind_udp_socket<A: ToSocketAddrs>(&self, addr: A) {}
+    pub(crate) fn umem(&self) -> &Rc<RefCell<Umem<'umem>>> {
+        &self.umem
+    }
+
+    pub(crate) fn bind_udp_socket<A: Into<SocketAddr>>(&self, addr: A, queue: TaskQueueHandle) {
+        let addr: SocketAddr = addr.into();
+        let reactor = self.reactor.upgrade().unwrap();
+        let source = Source::new(
+            IoRequirements::new(Latency::Matters(Duration::from_millis(10)), 0),
+            self.fd,
+            SourceType::XskPoll,
+            None,
+            Some(queue),
+        );
+        // let idx = to_user_data(add_source(&source, reactor_queue));
+    }
 }
 
 impl<'umem> Drop for XskSocketDriver<'umem> {
@@ -313,55 +333,6 @@ impl From<XskConfig> for libbpf_sys::xsk_socket_config {
         }
     }
 }
-
-// #[derive(Debug, Clone)]
-// struct Arena {
-//     inner: Rc<InnerArena>,
-// }
-
-// #[derive(Debug)]
-// struct InnerArena {
-//     base: ptr::NonNull<u8>,
-//     current: Cell<ptr::NonNull<u8>>,
-//     out_count: Cell<usize>,
-// }
-
-// unsafe impl Allocator for Arena {
-//     fn allocate(
-//         &self,
-//         layout: std::alloc::Layout,
-//     ) -> std::result::Result<ptr::NonNull<[u8]>, std::alloc::AllocError> {
-//         let align = layout.align();
-//         let size = layout.size();
-//         let base = size / align;
-//         if size % align != 0 {
-//             unsafe {
-//                 let ptr = self.inner.current.get().as_ptr().offset(size as
-// isize);                 let align_offset = ptr.align_offset(align);
-//                 ptr = ptr.offset(align_offset as isize);
-//                 self.inner.current.set(ptr::NonNull::new_unchecked(ptr));
-//                 *self.inner.out_count.as_ptr() += 1;
-//                 let p: *mut [u8] = slice::from_raw_parts_mut(ptr, size) as _;
-//                 return Ok(ptr::NonNull::new_unchecked(p));
-//             };
-//         }
-//         unsafe {
-//             let ptr = self.inner.current.get().as_ptr().add(base);
-//             self.inner.current.set(ptr::NonNull::new_unchecked(ptr));
-//             *self.inner.out_count.as_ptr() += 1;
-//             let p: *mut [u8] = slice::from_raw_parts_mut(ptr, size) as _;
-//             return Ok(ptr::NonNull::new_unchecked(p));
-//         }
-//     }
-
-//     unsafe fn deallocate(&self, ptr: ptr::NonNull<u8>, layout:
-// std::alloc::Layout) {         unsafe { *self.inner.out_count.as_ptr() -= 1 };
-//         if self.inner.out_count.get() == 0 {
-//             // reset the whole thing
-//             self.inner.current.set(self.inner.base);
-//         }
-//     }
-// }
 
 /// NOTE: there is probably a more efficient way to do this, but for not this
 /// will have to do. Also don't know that it's gonna actually end up running in
@@ -406,7 +377,6 @@ mod tests {
         let under = kick_iterations(10);
         let over = kick_iterations(25);
         let equal = kick_iterations(16);
-        dbg!(under, over, equal);
         assert_eq!(under, 1);
         assert_eq!(over, 2);
         assert_eq!(equal, 1);
@@ -467,6 +437,9 @@ mod tests {
                     recvd = frames.len();
                     Local::yield_if_needed().await;
                     if !frames.is_empty() {
+                        let packet = frames.pop().unwrap();
+                        let len = packet.ip_header_len();
+                        println!("LEN: {}, VERSION: {:?}", len, packet.ip_version(),);
                         let udppack = UdpPacket::new(frames.pop().unwrap());
                         let src = udppack.src_port();
                         let dst = udppack.dst_port();
@@ -479,7 +452,6 @@ mod tests {
                             len,
                             csum
                         );
-                        panic!("STOP HERE");
                     }
 
                     let count = umem.borrow_mut().fill_count();
@@ -506,8 +478,8 @@ mod tests {
                         f.buf(),
                         (f.ip_src(), f.ip_dst()),
                     );
-                    let mac_src = f.mac_src().to_vec();
-                    let mac_dst = f.mac_dst().to_vec();
+                    let mac_src = f.mac_src_raw().to_vec();
+                    let mac_dst = f.mac_dst_raw().to_vec();
                     f.mac_src_mut().copy_from_slice(&mac_dst[..]);
                     f.mac_dst_mut().copy_from_slice(&mac_src[..]);
                     let before_csum = f.ip_checksum().to_vec();
@@ -626,8 +598,8 @@ mod tests {
                         f.buf(),
                         (f.ip_src(), f.ip_dst()),
                     );
-                    let mac_src = f.mac_src().to_vec();
-                    let mac_dst = f.mac_dst().to_vec();
+                    let mac_src = f.mac_src_raw().to_vec();
+                    let mac_dst = f.mac_dst_raw().to_vec();
                     tracing::debug!(
                         "MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
                         mac_src[0],
@@ -637,7 +609,6 @@ mod tests {
                         mac_src[4],
                         mac_src[5]
                     );
-                    panic!("STOP HERE");
                     f.mac_src_mut().copy_from_slice(&mac_dst[..]);
                     f.mac_dst_mut().copy_from_slice(&mac_src[..]);
                     let before_csum = f.ip_checksum().to_vec();

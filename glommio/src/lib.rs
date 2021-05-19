@@ -436,6 +436,8 @@ mod error;
 mod executor;
 pub mod io;
 pub mod net;
+#[cfg(feature = "xdp")]
+mod netstack;
 mod shares;
 pub mod sync;
 pub mod timer;

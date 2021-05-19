@@ -4,7 +4,7 @@
 use std::{
     cell::RefCell,
     hash::{Hash, Hasher},
-    net::ToSocketAddrs,
+    net::{SocketAddr, ToSocketAddrs},
     rc::Rc,
 };
 
@@ -19,10 +19,11 @@ struct Udp {
 }
 
 impl Udp {
-    pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<Udp> {
+    pub fn bind<A: Into<SocketAddr>>(addr: A) -> Result<Udp> {
         let reactor = Local::get_reactor();
         let xsk = reactor.xsk_sockets.get(&xsk::QueueId(0)).unwrap().clone();
-        xsk.bind_udp_socket(addr);
+        // xsk.borrow().bind_udp_socket(addr);
+        let umem = xsk.borrow().umem().clone();
         Ok(Udp { xsk })
     }
 

@@ -25,11 +25,18 @@ use libbpf_sys::{
 };
 use libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_HUGETLB, MAP_PRIVATE, PROT_READ, PROT_WRITE};
 
-use crate::GlommioError;
+use crate::{
+    netstack::{ip, MacAddr, MacAddrRef},
+    GlommioError,
+};
 
 type Result<T> = std::result::Result<T, GlommioError<()>>;
 
 const PAGE_SIZE: u32 = 4096;
+
+const fn is_power_of_2(n: usize) -> bool {
+    ((n) & (n - 1)) == 0
+}
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct FrameRef {
@@ -56,6 +63,11 @@ pub struct Umem<'umem> {
 impl<'umem> Umem<'umem> {
     pub fn new(config: impl Into<UmemConfig>) -> Result<Umem<'umem>> {
         let config: UmemConfig = config.into();
+        assert!(is_power_of_2(config.num_descriptors as usize));
+        assert!(is_power_of_2(config.comp_size as usize));
+        assert!(is_power_of_2(config.fill_size as usize));
+        assert!(config.frame_size + config.frame_headroom <= 4096);
+
         let huge = config.use_huge_pages;
         let num_descriptors = config.num_descriptors;
         let ffi_config: xsk_umem_config = config.into();
@@ -175,6 +187,7 @@ impl<'umem> Umem<'umem> {
 
     pub fn alloc(&mut self, frames: impl Into<Option<usize>>) -> Vec<FrameBuf<'umem>> {
         let frame_size = self.frame_size;
+        println!("Frame size: {}", frame_size);
         let drained: Vec<_> = self
             .free_frames
             .drain(..frames.into().unwrap_or(1))
@@ -538,10 +551,61 @@ impl Default for UmemConfig {
 /// but still makes it possible to have two of those copies being mutated at
 /// once. It's hard to know how to resolve this without losing mutability
 /// altogether, or without runtime checks that might be overly costly.
-#[derive(Debug)]
+// #[derive(Debug)]
 pub struct FrameBuf<'umem> {
-    ptr: ptr::NonNull<Inner<'umem>>,
+    pub(crate) ptr: ptr::NonNull<Inner<'umem>>,
     phantom: PhantomData<&'umem ()>,
+}
+
+#[derive(Debug)]
+struct ParsedFrame<'umem> {
+    mac_src: MacAddr,
+    mac_dst: MacAddr,
+    ether_type: EtherType,
+    ip_src: Ipv4Addr,
+    ip_dst: Ipv4Addr,
+    ip_header_len: u8,
+    ip_checksum: [u8; 2],
+    ip_protocol: u8,
+    ip_ttl: u8,
+    ip_tos_or_precedence: u8,
+    umem: Option<*const Umem<'umem>>,
+}
+
+impl<'umem> fmt::Debug for FrameBuf<'umem> {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inner = unsafe { self.ptr.as_ref() };
+        let buf = &inner.data;
+        let umem = if inner.umem.is_null() {
+            None
+        } else {
+            Some(inner.umem)
+        }
+        .map(|item| item as *const Umem<'umem>);
+
+        let parsed = ParsedFrame {
+            mac_src: self.mac_src(),
+            mac_dst: self.mac_dst(),
+            ether_type: self.ether_type(),
+            ip_src: self.ip_src(),
+            ip_dst: self.ip_dst(),
+            ip_header_len: self.ip_header_len(),
+            ip_checksum: self.ip_checksum().try_into().unwrap(),
+            ip_protocol: self.ip_protocol(),
+            ip_ttl: self.ip_ttl(),
+            ip_tos_or_precedence: self.ip_tos_or_precedence(),
+            umem,
+        };
+        return fmt
+            .debug_struct("FrameBuf<'umem>")
+            .field("ref_cnt", &inner.ref_cnt)
+            .field("buf", buf)
+            .field("frame_ref", unsafe { inner.frame.as_ref() })
+            .field("umem", &umem)
+            .field("parsed_frame", &parsed)
+            .field("[frame-data]", &format!("{:x?}", &buf[..]))
+            .finish();
+    }
 }
 
 impl<'umem> Drop for FrameBuf<'umem> {
@@ -588,13 +652,49 @@ impl<'umem> FrameBuf<'umem> {
     const MAC_DST: Range<usize> = 0..6;
     const MAC_SRC: Range<usize> = 6..12;
     const ETHER_TYPE: Range<usize> = 12..14;
+    const IP_HDR_LEN: usize = 14;
+    const IP_VERSION: usize = 14;
+    const IP_TOS_OR_PRECEDENCE: usize = 15;
     const IP_SIZE: Range<usize> = 16..18;
     const IP_IDENTIFICATION: Range<usize> = 18..20;
     const IP_FRAGMENT_OFFSET: Range<usize> = 20..22;
+    const IP_TTL: usize = 22;
+    const IP_PROTOCOL: usize = 23;
     const IP_CHECKSUM: Range<usize> = 24..26;
     const IP_SRC: Range<usize> = 26..30;
     const IP_DST: Range<usize> = 30..34;
     const IP_OPTIONS: Range<usize> = 34..38;
+
+    /// NOTE: We only want this for tests (for now) because we don't want every
+    /// test that requires a FrameBuf to also require a umem be created.
+    #[cfg(test)]
+    pub(crate) fn new() -> FrameBuf<'umem> {
+        const BUF_SIZE: usize = 320;
+        unsafe {
+            let frame_ref = Box::into_raw(Box::new(FrameRef {
+                addr: 0.into(),
+                len: (BUF_SIZE as u32).into(),
+                options: 0.into(),
+            }));
+            let mut buf = vec![0; BUF_SIZE];
+            buf.set_len(BUF_SIZE);
+            let (ptr, len) = (buf.as_mut_ptr(), buf.len());
+            std::mem::forget(buf);
+            let inner = Box::into_raw(Box::new(Inner {
+                data: Buf {
+                    ptr: ptr::NonNull::new_unchecked(ptr),
+                    len,
+                },
+                frame: ptr::NonNull::new_unchecked(frame_ref),
+                ref_cnt: 1.into(),
+                umem: ptr::null_mut(),
+            }));
+            FrameBuf {
+                ptr: ptr::NonNull::new_unchecked(inner),
+                phantom: Default::default(),
+            }
+        }
+    }
 
     pub(crate) fn ptr_mut(&mut self) -> *mut Inner<'umem> {
         self.ptr.as_ptr()
@@ -652,8 +752,21 @@ impl<'umem> FrameBuf<'umem> {
             .set(options);
     }
 
-    pub fn mac_dst(&self) -> &[u8] {
+    /// TODO: could panic on unwrap, consider returing option
+    pub fn mac_dst(&self) -> MacAddr {
+        MacAddr::new(self[Self::MAC_DST].try_into().unwrap())
+    }
+
+    pub fn mac_dst_raw(&self) -> &[u8] {
         &self[Self::MAC_DST]
+    }
+
+    pub fn mac_dst_ref(&self) -> MacAddrRef<'_> {
+        MacAddrRef::new(&self[Self::MAC_DST])
+    }
+
+    pub fn set_mac_dst(&mut self, mac: MacAddr) {
+        self[Self::MAC_DST].copy_from_slice(&*mac);
     }
 
     pub fn mac_dst_mut(&mut self) -> &mut [u8] {
@@ -661,8 +774,17 @@ impl<'umem> FrameBuf<'umem> {
     }
 
     /// L2 MAC source slice
-    pub fn mac_src(&self) -> &[u8] {
+    pub fn mac_src_raw(&self) -> &[u8] {
         &self[Self::MAC_SRC]
+    }
+
+    /// TODO: could panic on unwrap, consider returing option
+    pub fn mac_src(&self) -> MacAddr {
+        MacAddr::new(self[Self::MAC_SRC].try_into().unwrap())
+    }
+
+    pub fn mac_src_ref(&self) -> MacAddrRef<'_> {
+        MacAddrRef::new(&self[Self::MAC_SRC])
     }
 
     /// Mutable L2 MAC source slice
@@ -693,21 +815,55 @@ impl<'umem> FrameBuf<'umem> {
     }
 
     /// Mutable access to the ethertype
-    pub fn set_ether_type(&mut self, ether_type: u16) {
-        let arr = ether_type.to_be_bytes();
+    pub fn set_ether_type(&mut self, ether_type: EtherType) {
+        let arr = (ether_type as u16).to_be_bytes();
         self[Self::ETHER_TYPE].copy_from_slice(&arr);
     }
 
     pub fn ip_header_len(&self) -> u8 {
-        (self[14] & 0b00001111) * 4
+        4 * (self[Self::IP_HDR_LEN] & 0b00001111)
     }
 
-    pub fn ip_tos(&self) -> u8 {
-        self[15]
+    const fn calculate_ip_hdr_len(len: u8) -> u8 {
+        (len / 4) & 0b00001111
     }
 
-    pub fn ip_total_size(&self) -> &[u8] {
+    pub fn set_ip_header_len(&mut self, len: u8) {
+        let four_bit_len = Self::calculate_ip_hdr_len(len);
+        assert!((5..=6).contains(&four_bit_len));
+        self[Self::IP_HDR_LEN] |= four_bit_len;
+    }
+
+    pub fn ip_version(&self) -> Option<ip::IpVersion> {
+        match (self[Self::IP_VERSION] & 0b11110000) >> 4 {
+            4 => Some(ip::IpVersion::V4),
+            6 => Some(ip::IpVersion::V6),
+            _ => None,
+        }
+    }
+
+    pub fn set_ip_version(&mut self, version: ip::IpVersion) {
+        let ver: u8 = match version {
+            ip::IpVersion::V4 => (4 << 4) & 0b11110000,
+            ip::IpVersion::V6 => (6 << 4) & 0b11110000,
+        };
+        self[Self::IP_VERSION] |= ver;
+    }
+
+    pub fn ip_tos_or_precedence(&self) -> u8 {
+        self[Self::IP_TOS_OR_PRECEDENCE].to_le()
+    }
+
+    pub fn set_ip_tos_or_precedence(&mut self, tos_precedence: u8) {
+        self[Self::IP_TOS_OR_PRECEDENCE] = tos_precedence.to_be();
+    }
+
+    pub fn ip_total_len(&self) -> &[u8] {
         &self[Self::IP_SIZE]
+    }
+
+    pub fn set_ip_total_len(&mut self, len: u16) {
+        self[Self::IP_SIZE].copy_from_slice(&len.to_be_bytes());
     }
 
     pub fn ip_identification(&self) -> &[u8] {
@@ -719,11 +875,19 @@ impl<'umem> FrameBuf<'umem> {
     }
 
     pub fn ip_ttl(&self) -> u8 {
-        self[22]
+        self[Self::IP_TTL].to_le()
+    }
+
+    pub fn set_ip_ttl(&mut self, ttl: u8) {
+        self[Self::IP_TTL] = ttl.to_be();
     }
 
     pub fn ip_protocol(&self) -> u8 {
-        self[23]
+        self[Self::IP_PROTOCOL].to_le()
+    }
+
+    pub fn set_ip_protocol(&mut self, protocol: u8) {
+        self[Self::IP_PROTOCOL] = protocol.to_be();
     }
 
     pub fn ip_checksum(&self) -> &[u8] {
@@ -778,6 +942,7 @@ impl<'umem> FrameBuf<'umem> {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct UdpPacket<'umem> {
     frame: FrameBuf<'umem>,
 }
@@ -826,6 +991,26 @@ impl UdpPacket<'_> {
         self.insert_u16(checksum, Self::CSUM);
     }
 
+    /// src_ip, dst_ip, protocol, length, 8 bit reserved + udp header + udp data
+    pub(crate) fn calculate_udp_checksum(&mut self) {
+        let proto = vec![self.frame.ip_protocol()];
+        let len = vec![self.frame.ip_header_len()];
+        let virt: Vec<_> = self
+            .frame
+            .ip_src_raw()
+            .chain(self.frame.ip_dst_raw())
+            .chain(&proto[..])
+            .chain(&len[..])
+            .chain(&self.frame[34..42])
+            .chain(&self.frame[42..])
+            .bytes()
+            .filter(std::result::Result::is_ok)
+            .map(std::result::Result::unwrap)
+            .collect();
+        let csum = checksum(virt.as_slice());
+        self.set_checksum(csum);
+    }
+
     fn extract_u16(&self, range: Range<usize>) -> u16 {
         let data = &self.frame[range];
         u16::from_be_bytes(data.try_into().unwrap())
@@ -844,6 +1029,7 @@ fn read_u16_be<IO: Read>(mut cursor: IO) -> Result<u16> {
 
 /// Calculate the checksum for an IPv4 packet.
 pub fn checksum(buffer: &[u8]) -> u16 {
+    println!("Checksum BUFFER: {:?}", buffer);
     use std::io::Cursor;
 
     let mut result = 0xffffu32;
@@ -880,6 +1066,7 @@ pub enum EtherType {
 #[derive(Debug)]
 pub(crate) struct Inner<'umem> {
     data: Buf,
+    /// TODO: make an accessor if need be.. don't bother exposing this
     pub(crate) frame: ptr::NonNull<FrameRef>,
     ref_cnt: Cell<usize>,
     umem: *mut Umem<'umem>,
@@ -933,6 +1120,20 @@ impl<'umem> ops::DerefMut for FrameBuf<'umem> {
 mod tests {
     use super::*;
     use std::ptr::NonNull;
+
+    #[test]
+    fn power_of_two() {
+        assert_eq!(false, is_power_of_2(10));
+        assert_eq!(true, is_power_of_2(8));
+        assert_eq!(false, is_power_of_2(6));
+        assert_eq!(true, is_power_of_2(128));
+        assert_eq!(true, is_power_of_2(256));
+        assert_eq!(false, is_power_of_2(300));
+        assert_eq!(false, is_power_of_2(600));
+        assert_eq!(true, is_power_of_2(1024));
+        assert_eq!(true, is_power_of_2(4096));
+        assert_eq!(false, is_power_of_2(10_000));
+    }
 
     #[test]
     #[cfg_attr(not(feature = "xdp"), ignore)]

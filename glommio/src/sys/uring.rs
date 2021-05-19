@@ -14,10 +14,12 @@ use std::{
     cell::{Cell, Ref, RefCell, RefMut},
     collections::VecDeque,
     ffi::CStr,
-    fmt, io,
+    fmt,
+    io,
     io::{Error, ErrorKind, IoSlice},
     os::unix::io::RawFd,
-    panic, ptr,
+    panic,
+    ptr,
     rc::Rc,
     sync::Arc,
     task::Waker,
@@ -31,9 +33,19 @@ use crate::{
     sys::{
         self,
         dma_buffer::{BufferStorage, DmaBuffer},
-        DirectIo, InnerSource, IoBuffer, PollableStatus, Source, SourceType,
+        DirectIo,
+        InnerSource,
+        IoBuffer,
+        PollableStatus,
+        Source,
+        SourceType,
     },
-    uring_sys, IoRequirements, IoStats, Latency, RingIoStats, TaskQueueHandle,
+    uring_sys,
+    IoRequirements,
+    IoStats,
+    Latency,
+    RingIoStats,
+    TaskQueueHandle,
 };
 use buddy_alloc::buddy_alloc::{BuddyAlloc, BuddyAllocParam};
 use nix::sys::{
@@ -480,13 +492,13 @@ pub(crate) type SourceId = Idx<Rc<InnerSource>>;
 fn from_user_data(user_data: u64) -> SourceId {
     SourceId::from_raw((user_data - 1) as usize)
 }
-fn to_user_data(id: SourceId) -> u64 {
+pub(crate) fn to_user_data(id: SourceId) -> u64 {
     id.to_raw() as u64 + 1
 }
 
 thread_local!(static SOURCE_MAP: RefCell<SourceMap> = Default::default());
 
-fn add_source(source: &Source, queue: ReactorQueue) -> SourceId {
+pub(crate) fn add_source(source: &Source, queue: ReactorQueue) -> SourceId {
     SOURCE_MAP.with(|x| {
         let item = source.inner.clone();
         let id = x.borrow_mut().alloc(item);
@@ -1111,6 +1123,7 @@ macro_rules! consume_rings {
         consumed
     }}
 }
+
 macro_rules! flush_cancellations {
     (into $output:expr; $( $ring:expr ),+ ) => {{
         $(
