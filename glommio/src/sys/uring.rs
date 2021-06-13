@@ -14,12 +14,10 @@ use std::{
     cell::{Cell, Ref, RefCell, RefMut},
     collections::VecDeque,
     ffi::CStr,
-    fmt,
-    io,
+    fmt, io,
     io::{Error, ErrorKind, IoSlice},
     os::unix::io::RawFd,
-    panic,
-    ptr,
+    panic, ptr,
     rc::Rc,
     sync::Arc,
     task::Waker,
@@ -33,19 +31,9 @@ use crate::{
     sys::{
         self,
         dma_buffer::{BufferStorage, DmaBuffer},
-        DirectIo,
-        InnerSource,
-        IoBuffer,
-        PollableStatus,
-        Source,
-        SourceType,
+        DirectIo, InnerSource, IoBuffer, PollableStatus, Source, SourceType,
     },
-    uring_sys,
-    IoRequirements,
-    IoStats,
-    Latency,
-    RingIoStats,
-    TaskQueueHandle,
+    uring_sys, IoRequirements, IoStats, Latency, RingIoStats, TaskQueueHandle,
 };
 use buddy_alloc::buddy_alloc::{BuddyAlloc, BuddyAllocParam};
 use nix::sys::{
@@ -88,7 +76,7 @@ enum UringOpDescriptor {
 }
 
 #[derive(Debug)]
-struct UringDescriptor {
+pub(crate) struct UringDescriptor {
     fd: RawFd,
     flags: SubmissionFlags,
     user_data: u64,
@@ -564,7 +552,7 @@ impl UringQueueState {
     }
 }
 
-trait UringCommon {
+pub trait UringCommon {
     fn submission_queue(&mut self) -> ReactorQueue;
     fn submit_sqes(&mut self) -> io::Result<usize>;
     fn needs_kernel_enter(&self) -> bool;
@@ -875,7 +863,7 @@ impl Drop for Source {
     }
 }
 
-struct SleepableRing {
+pub(crate) struct SleepableRing {
     ring: iou::IoUring,
     size: usize,
     submission_queue: ReactorQueue,
@@ -1092,7 +1080,7 @@ impl UringCommon for SleepableRing {
 pub(crate) struct Reactor {
     // FIXME: it is starting to feel we should clean this up to a Inner pattern
     main_ring: RefCell<SleepableRing>,
-    latency_ring: RefCell<SleepableRing>,
+    pub(crate) latency_ring: RefCell<SleepableRing>,
     poll_ring: RefCell<PollRing>,
 
     timeout_src: Cell<Option<Source>>,

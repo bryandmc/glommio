@@ -24,9 +24,16 @@
 //! those tasks on the same thread, no thread context switch is necessary when
 //! going between task execution and I/O.
 
-use crate::iou::sqe::SockAddrStorage;
 #[cfg(feature = "xdp")]
-use crate::sys::{umem::Umem, xsk};
+use crate::{
+    ref_cnt,
+    sys::{
+        umem::{self, Umem},
+        xsk::{self, XskConfig},
+    },
+};
+
+use crate::iou::sqe::SockAddrStorage;
 use ahash::AHashMap;
 use nix::sys::socket::{MsgFlags, SockAddr};
 use std::{
@@ -75,19 +82,8 @@ pub(crate) struct Parker {
     inner: Rc<Inner>,
 }
 
-const FILL_LOW_WATER_LINE: usize = 200;
-
 impl UnwindSafe for Parker {}
 impl RefUnwindSafe for Parker {}
-
-#[cfg(feature = "xdp")]
-pub(crate) struct XskRingTick {
-    queue: xsk::QueueId,
-    filled: usize,
-    rx: usize,
-    tx: usize,
-    completion: usize,
-}
 
 impl Parker {
     /// Creates a new parker.
@@ -289,29 +285,14 @@ pub(crate) struct Reactor {
     /// refcell) every time. Acquire during initialization
     preempt_ptr_head: *const u32,
     preempt_ptr_tail: *const AtomicU32,
-
-    /// This is annoying.. Might need a better way than this to allow for there
-    /// to "maybe" be a umem.. It might get annoying to have to constantly
-    /// unwrap/drill into this option to get at the umem.
-    #[cfg(feature = "xdp")]
-    pub(crate) umem: Option<Rc<RefCell<Umem<'static>>>>,
-
-    /// TODO: unsure this is where this will live..
-    #[cfg(feature = "xdp")]
-    pub(crate) xsk_sockets: AHashMap<xsk::QueueId, Rc<RefCell<xsk::XskSocketDriver<'static>>>>,
 }
 
 impl Reactor {
     #[cfg(feature = "xdp")]
-    pub(crate) fn new(
-        notifier: Arc<SleepNotifier>,
-        io_memory: usize,
-        umem: Option<Umem<'static>>,
-    ) -> Reactor {
+    pub(crate) fn new(notifier: Arc<SleepNotifier>, io_memory: usize) -> Reactor {
         let sys = sys::Reactor::new(notifier, io_memory)
             .expect("cannot initialize I/O event notification");
         let (preempt_ptr_head, preempt_ptr_tail) = sys.preempt_pointers();
-        let actual_umem = umem.map(|inner| Rc::new(RefCell::new(inner)));
         Reactor {
             sys,
             timers: RefCell::new(Timers::new()),
@@ -319,8 +300,6 @@ impl Reactor {
             current_io_requirements: Cell::new(IoRequirements::default()),
             preempt_ptr_head,
             preempt_ptr_tail: preempt_ptr_tail as _,
-            umem: actual_umem,
-            xsk_sockets: AHashMap::new(),
         }
     }
 
@@ -360,6 +339,11 @@ impl Reactor {
     pub(crate) fn notify(&self, remote: RawFd) {
         sys::write_eventfd(remote);
     }
+
+    // #[cfg(feature = "xdp")]
+    // pub fn mempool(&self) -> &umem::Mempool {
+    //     &self.mempool
+    // }
 
     fn new_source(
         &self,
@@ -765,8 +749,6 @@ impl Reactor {
         self.sys
             .rush_dispatch(Some(Latency::NotImportant), &mut woke)?;
         self.sys.rush_dispatch(None, &mut woke)?;
-        #[cfg(feature = "xdp")]
-        self.process_xsk_rings(&mut woke)?;
 
         woke += self.process_timers().1;
         woke += self.process_shared_channels();
@@ -780,67 +762,11 @@ impl Reactor {
         (next_timer, woke)
     }
 
-    #[cfg(feature = "xdp")]
-    fn process_one_xsk_socket(
-        &self,
-        xsk: &RefCell<xsk::XskSocketDriver<'_>>,
-    ) -> crate::Result<(usize, usize, usize), ()> {
-        let mut xsk_ref = xsk.borrow_mut();
-        let packets = xsk_ref.consume_rx();
-        let mut TX_PLACEHOLDER = vec![];
-        let sent = xsk_ref.produce_tx(&mut TX_PLACEHOLDER);
-        if xsk_ref.tx_needs_wakeup() {
-            // Produce pending TX
-            let sent = xsk_ref.produce_tx(&mut TX_PLACEHOLDER);
-        };
-        let mut accumulator = 0;
-        while xsk_ref.completions() > 0 {
-            accumulator += xsk_ref.consume_completions()?;
-        }
-        Ok((packets.len(), sent, accumulator))
-    }
-
-    /// TODO: Pick up from here ..
-    ///
-    /// 1.) Is this the right place for this stuff?
-    /// 2.) Are we allocating too much for various containers to shuffle stuff
-    /// around?
-    /// 3.) Start by starting from the user-facing portion and working the
-    /// connective tissue back towards these root, synchronous implementations.
-    #[cfg(feature = "xdp")]
-    fn process_xsk_rings(&self, wakers: &mut usize) -> crate::Result<Vec<XskRingTick>, ()> {
-        let mut filled = 0;
-        if let Some(ref umem) = self.umem {
-            let c = umem.clone();
-            let mut umem_ref = (*c).borrow_mut();
-            if umem_ref.fill_count() < FILL_LOW_WATER_LINE {
-                filled = umem_ref.fill_frames(200);
-            }
-        }
-        let mut processing_manifest = vec![];
-        for (queue, xsk) in self.xsk_sockets.iter() {
-            let (rx, tx, completion) = self.process_one_xsk_socket(xsk)?;
-            processing_manifest.push(XskRingTick {
-                queue: *queue,
-                filled,
-                rx,
-                tx,
-                completion,
-            })
-        }
-
-        Ok(processing_manifest)
-    }
-
     /// Processes new events, blocking until the first event or the timeout.
     fn react(&self, timeout: Option<Duration>) -> io::Result<()> {
         // Process ready timers.
         let (next_timer, woke) = self.process_external_events();
 
-        if cfg!(feature = "xdp") {
-            #[cfg(feature = "xdp")]
-            let closure = |wakers| self.process_xsk_rings(wakers);
-        }
         // Block on I/O events.
         match self
             .sys

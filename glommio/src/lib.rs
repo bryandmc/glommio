@@ -322,6 +322,14 @@ mod parking;
 mod sys;
 pub mod task;
 
+#[cfg(feature = "xdp")]
+mod xdp {
+    pub use super::sys::{umem, xsk};
+}
+
+#[cfg(feature = "xdp")]
+pub use xdp::*;
+
 #[allow(dead_code)]
 #[allow(clippy::upper_case_acronyms)]
 mod uring_sys;
@@ -436,8 +444,8 @@ mod error;
 mod executor;
 pub mod io;
 pub mod net;
-#[cfg(feature = "xdp")]
-mod netstack;
+// #[cfg(feature = "xdp")]
+// mod netstack;
 mod shares;
 pub mod sync;
 pub mod timer;

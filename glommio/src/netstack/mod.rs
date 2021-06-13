@@ -40,8 +40,8 @@ trait Protocol {
 struct Ethernet<'a>(PhantomData<&'a ()>);
 
 impl<'a> Protocol for Ethernet<'a> {
-    type Input = umem::FrameBuf<'a>;
-    type Output = umem::FrameBuf<'a>;
+    type Input = umem::FrameBuf;
+    type Output = umem::FrameBuf;
 
     fn process_packet(&self, input: Self::Input) -> Self::Output {
         let ty = input.ether_type();

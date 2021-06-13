@@ -4,17 +4,18 @@
 use core::{fmt, slice};
 use std::{
     borrow::BorrowMut,
-    cell::Cell,
+    cell::{Cell, RefCell},
     cmp,
     collections::VecDeque,
     convert::TryInto,
     io,
     io::prelude::*,
-    marker::PhantomData,
+    mem,
     net::Ipv4Addr,
     ops::{self, Index, IndexMut, Range},
     os::unix::io::{AsRawFd, RawFd},
-    ptr,
+    ptr::{self, addr_of, addr_of_mut},
+    rc::Rc,
     slice::SliceIndex,
 };
 
@@ -24,11 +25,14 @@ use libbpf_sys::{
     XSK_UMEM__DEFAULT_FRAME_SIZE,
 };
 use libc::{MAP_ANONYMOUS, MAP_FAILED, MAP_HUGETLB, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+use scoped_tls::scoped_thread_local;
 
-use crate::{
-    netstack::{ip, MacAddr, MacAddrRef},
-    GlommioError,
-};
+use crate::GlommioError;
+
+scoped_thread_local!(pub(crate) static MEMPOOL: Rc<RefCell<Umem>>);
+
+/// Memory pool backed by UMEM
+pub type MemPool = Rc<RefCell<Umem>>;
 
 type Result<T> = std::result::Result<T, GlommioError<()>>;
 
@@ -45,7 +49,69 @@ pub struct FrameRef {
     pub(crate) options: Cell<u32>,
 }
 
-pub struct Umem<'umem> {
+#[derive(Debug)]
+pub struct Shared<T: fmt::Debug> {
+    inner: ptr::NonNull<SharedInner<T>>,
+}
+
+#[derive(Debug)]
+struct SharedInner<T: fmt::Debug> {
+    value: T,
+    ref_cnt: Cell<usize>,
+}
+
+impl<T: fmt::Debug> Shared<T> {
+    pub fn new(t: T) -> Shared<T> {
+        let mut inner = SharedInner {
+            value: t,
+            ref_cnt: 1.into(),
+        };
+        let ptr = addr_of_mut!(inner);
+        mem::forget(inner);
+        Shared {
+            inner: unsafe { ptr::NonNull::new_unchecked(ptr) },
+        }
+    }
+}
+
+impl<T: fmt::Debug> Drop for Shared<T> {
+    fn drop(&mut self) {
+        unsafe {
+            let inner = self.inner.as_ptr();
+            (*inner).ref_cnt.set((*inner).ref_cnt.get() - 1);
+            println!("Are we going to drop: {:?}", *inner);
+            if (*inner).ref_cnt.get() == 0 {
+                println!("Definitely going to drop: {:?}", *inner);
+                ptr::drop_in_place(inner);
+                // mem::forget(inner);
+            }
+        }
+    }
+}
+
+impl<T: fmt::Debug> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        let inner = unsafe { self.inner.as_ref() };
+        inner.ref_cnt.set(inner.ref_cnt.get() + 1);
+        Shared { inner: self.inner }
+    }
+}
+
+impl<T: fmt::Debug> ops::Deref for Shared<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &self.inner.as_ref().value }
+    }
+}
+
+impl<T: fmt::Debug> ops::DerefMut for Shared<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut self.inner.as_mut().value }
+    }
+}
+
+pub struct Umem {
     umem: Box<xsk_umem>,
     fill_queue: Box<libbpf_sys::xsk_ring_prod>,
     completion_queue: Box<libbpf_sys::xsk_ring_cons>,
@@ -57,12 +123,13 @@ pub struct Umem<'umem> {
     memory: MemoryRegion,
     free_frames: VecDeque<Box<FrameRef>>,
     filled_frames: VecDeque<Box<FrameRef>>,
-    __lifetime: PhantomData<&'umem ()>,
+    // __lifetime: PhantomData<&'umem ()>,
 }
 
-impl<'umem> Umem<'umem> {
-    pub fn new(config: impl Into<UmemConfig>) -> Result<Umem<'umem>> {
+impl Umem {
+    pub fn new(config: impl Into<UmemConfig>) -> Result<Umem> {
         let config: UmemConfig = config.into();
+        println!("Creating umem: {:?}", config);
         assert!(is_power_of_2(config.num_descriptors as usize));
         assert!(is_power_of_2(config.comp_size as usize));
         assert!(is_power_of_2(config.fill_size as usize));
@@ -103,6 +170,7 @@ impl<'umem> Umem<'umem> {
         if fd < 0 {
             return Err(io::Error::last_os_error().into());
         }
+        println!("Umem FD: {}", fd);
 
         let mut descriptors: VecDeque<Box<FrameRef>> =
             VecDeque::with_capacity(num_descriptors.try_into()?);
@@ -133,20 +201,23 @@ impl<'umem> Umem<'umem> {
                 /// inherently somewhat wasteful but luckily each element is
                 /// only a pointer size.
                 filled_frames: VecDeque::with_capacity(num_descriptors.try_into()?),
-                __lifetime: Default::default(),
             })
         }
     }
 
-    pub fn memory(&self) -> &MemoryRegion {
+    pub fn get() -> MemPool {
+        MEMPOOL.with(|item| item.clone())
+    }
+
+    pub(crate) fn memory(&self) -> &MemoryRegion {
         &self.memory
     }
 
-    pub fn memory_mut(&mut self) -> &mut MemoryRegion {
+    pub(crate) fn memory_mut(&mut self) -> &mut MemoryRegion {
         &mut self.memory
     }
 
-    pub fn from_ref(&mut self, rref: Box<FrameRef>) -> Option<FrameBuf<'umem>> {
+    pub(crate) fn from_ref(&self, rref: Box<FrameRef>) -> Option<FrameBuf> {
         let memory_root_ptr = unsafe { self.memory.as_mut_ptr() };
         let mem_ptr = unsafe {
             memory_root_ptr
@@ -160,7 +231,7 @@ impl<'umem> Umem<'umem> {
                 return None;
             } // bail out here, and we'll filter them out
         };
-        let this = ptr::addr_of_mut!(*self);
+        let this = ptr::addr_of!(*self) as *mut _;
         let x = Inner {
             data: Buf {
                 ptr: mptr,
@@ -179,13 +250,10 @@ impl<'umem> Umem<'umem> {
             } // bail out here, and we'll filter them out
         };
 
-        Some(FrameBuf {
-            ptr: iptr,
-            phantom: Default::default(),
-        })
+        Some(FrameBuf { ptr: iptr })
     }
 
-    pub fn alloc(&mut self, frames: impl Into<Option<usize>>) -> Vec<FrameBuf<'umem>> {
+    pub(crate) fn alloc(&mut self, frames: impl Into<Option<usize>>) -> Vec<FrameBuf> {
         let frame_size = self.frame_size;
         println!("Frame size: {}", frame_size);
         let drained: Vec<_> = self
@@ -212,27 +280,27 @@ impl<'umem> Umem<'umem> {
         filtered
     }
 
-    pub fn umem_ptr(&mut self) -> *mut libbpf_sys::xsk_umem {
+    pub(crate) fn umem_ptr(&mut self) -> *mut libbpf_sys::xsk_umem {
         self.umem.as_mut() as _
     }
 
-    pub fn fq(&self) -> &libbpf_sys::xsk_ring_prod {
+    pub(crate) fn fq(&self) -> &libbpf_sys::xsk_ring_prod {
         self.fill_queue.as_ref()
     }
 
-    pub fn fq_mut(&mut self) -> &mut libbpf_sys::xsk_ring_prod {
+    pub(crate) fn fq_mut(&mut self) -> &mut libbpf_sys::xsk_ring_prod {
         self.fill_queue.as_mut()
     }
 
-    pub fn cq(&self) -> &libbpf_sys::xsk_ring_cons {
+    pub(crate) fn cq(&self) -> &libbpf_sys::xsk_ring_cons {
         self.completion_queue.as_ref()
     }
 
-    pub fn cq_mut(&mut self) -> &mut libbpf_sys::xsk_ring_cons {
+    pub(crate) fn cq_mut(&mut self) -> &mut libbpf_sys::xsk_ring_cons {
         self.completion_queue.as_mut()
     }
 
-    pub fn fill_frames(&mut self, mut amt: usize) -> usize {
+    pub(crate) fn fill_frames(&mut self, mut amt: usize) -> usize {
         log_queue_counts!(self.fill_queue, "FILL");
         tracing::trace!("Going to attempt to fill {} descriptors..", amt);
         let mut idx = 0;
@@ -275,8 +343,13 @@ impl<'umem> Umem<'umem> {
         &self.filled_frames
     }
 
-    pub(crate) fn filled_frames_mut(&mut self) -> &mut VecDeque<Box<FrameRef>> {
-        &mut self.filled_frames
+    /// Probably very unsafe..
+    pub(crate) unsafe fn filled_frames_mut(&self) -> &mut VecDeque<Box<FrameRef>> {
+        unsafe {
+            (&self.filled_frames as *const VecDeque<_> as *mut VecDeque<_>)
+                .as_mut()
+                .unwrap()
+        }
     }
 
     pub(crate) fn free_frames_mut(&mut self) -> &mut VecDeque<Box<FrameRef>> {
@@ -313,7 +386,7 @@ impl<'umem> Umem<'umem> {
     }
 }
 
-impl<'umem> fmt::Debug for Umem<'umem> {
+impl fmt::Debug for Umem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Umem")
             .field("umem", &self.umem)
@@ -328,7 +401,7 @@ impl<'umem> fmt::Debug for Umem<'umem> {
     }
 }
 
-impl<'umem> Drop for Umem<'umem> {
+impl Drop for Umem {
     fn drop(&mut self) {
         unsafe {
             tracing::trace!(
@@ -346,7 +419,7 @@ impl<'umem> Drop for Umem<'umem> {
 }
 
 #[derive(Debug)]
-pub struct MemoryRegion {
+pub(crate) struct MemoryRegion {
     len: u32,
     mem_ptr: ptr::NonNull<u8>,
 }
@@ -402,7 +475,7 @@ impl MemoryRegion {
         }
     }
 
-    pub(crate) unsafe fn as_mut_ptr(&mut self) -> *mut libc::c_void {
+    pub(crate) unsafe fn as_mut_ptr(&self) -> *mut libc::c_void {
         self.mem_ptr.as_ptr() as _
     }
 
@@ -498,7 +571,7 @@ impl UmemBuilder {
         }
     }
 
-    pub fn build<'umem>(self) -> Result<Umem<'umem>> {
+    pub fn build<'umem>(self) -> Result<Umem> {
         Umem::new(self)
     }
 }
@@ -552,15 +625,14 @@ impl Default for UmemConfig {
 /// once. It's hard to know how to resolve this without losing mutability
 /// altogether, or without runtime checks that might be overly costly.
 // #[derive(Debug)]
-pub struct FrameBuf<'umem> {
-    pub(crate) ptr: ptr::NonNull<Inner<'umem>>,
-    phantom: PhantomData<&'umem ()>,
+pub struct FrameBuf {
+    pub(crate) ptr: ptr::NonNull<Inner>,
 }
 
 #[derive(Debug)]
-struct ParsedFrame<'umem> {
-    mac_src: MacAddr,
-    mac_dst: MacAddr,
+struct ParsedFrame {
+    // mac_src: MacAddr,
+    // mac_dst: MacAddr,
     ether_type: EtherType,
     ip_src: Ipv4Addr,
     ip_dst: Ipv4Addr,
@@ -569,10 +641,10 @@ struct ParsedFrame<'umem> {
     ip_protocol: u8,
     ip_ttl: u8,
     ip_tos_or_precedence: u8,
-    umem: Option<*const Umem<'umem>>,
+    umem: Option<*const Umem>,
 }
 
-impl<'umem> fmt::Debug for FrameBuf<'umem> {
+impl fmt::Debug for FrameBuf {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = unsafe { self.ptr.as_ref() };
         let buf = &inner.data;
@@ -581,11 +653,9 @@ impl<'umem> fmt::Debug for FrameBuf<'umem> {
         } else {
             Some(inner.umem)
         }
-        .map(|item| item as *const Umem<'umem>);
+        .map(|item| item as *const Umem);
 
         let parsed = ParsedFrame {
-            mac_src: self.mac_src(),
-            mac_dst: self.mac_dst(),
             ether_type: self.ether_type(),
             ip_src: self.ip_src(),
             ip_dst: self.ip_dst(),
@@ -597,7 +667,7 @@ impl<'umem> fmt::Debug for FrameBuf<'umem> {
             umem,
         };
         return fmt
-            .debug_struct("FrameBuf<'umem>")
+            .debug_struct("FrameBuf")
             .field("ref_cnt", &inner.ref_cnt)
             .field("buf", buf)
             .field("frame_ref", unsafe { inner.frame.as_ref() })
@@ -608,7 +678,7 @@ impl<'umem> fmt::Debug for FrameBuf<'umem> {
     }
 }
 
-impl<'umem> Drop for FrameBuf<'umem> {
+impl Drop for FrameBuf {
     fn drop(&mut self) {
         let ptr = self.ptr.as_ptr();
         if !ptr.is_null() {
@@ -627,7 +697,7 @@ impl<'umem> Drop for FrameBuf<'umem> {
     }
 }
 
-impl<'umem> Clone for FrameBuf<'umem> {
+impl Clone for FrameBuf {
     fn clone(&self) -> Self {
         let ptr = self.ptr.as_ptr();
         match unsafe { ptr.as_ref() } {
@@ -635,7 +705,6 @@ impl<'umem> Clone for FrameBuf<'umem> {
                 inner.ref_cnt.set(inner.ref_cnt.get() + 1);
                 FrameBuf {
                     ptr: self.ptr, // ptr::NonNull::new_unchecked(ptr),
-                    phantom: Default::default(),
                 }
             }
             None => {
@@ -648,7 +717,7 @@ impl<'umem> Clone for FrameBuf<'umem> {
     }
 }
 
-impl<'umem> FrameBuf<'umem> {
+impl FrameBuf {
     const MAC_DST: Range<usize> = 0..6;
     const MAC_SRC: Range<usize> = 6..12;
     const ETHER_TYPE: Range<usize> = 12..14;
@@ -668,7 +737,7 @@ impl<'umem> FrameBuf<'umem> {
     /// NOTE: We only want this for tests (for now) because we don't want every
     /// test that requires a FrameBuf to also require a umem be created.
     #[cfg(test)]
-    pub(crate) fn new() -> FrameBuf<'umem> {
+    pub(crate) fn new() -> FrameBuf {
         const BUF_SIZE: usize = 320;
         unsafe {
             let frame_ref = Box::into_raw(Box::new(FrameRef {
@@ -691,12 +760,11 @@ impl<'umem> FrameBuf<'umem> {
             }));
             FrameBuf {
                 ptr: ptr::NonNull::new_unchecked(inner),
-                phantom: Default::default(),
             }
         }
     }
 
-    pub(crate) fn ptr_mut(&mut self) -> *mut Inner<'umem> {
+    pub(crate) fn ptr_mut(&mut self) -> *mut Inner {
         self.ptr.as_ptr()
     }
 
@@ -753,21 +821,21 @@ impl<'umem> FrameBuf<'umem> {
     }
 
     /// TODO: could panic on unwrap, consider returing option
-    pub fn mac_dst(&self) -> MacAddr {
-        MacAddr::new(self[Self::MAC_DST].try_into().unwrap())
-    }
+    // pub fn mac_dst(&self) -> MacAddr {
+    //     MacAddr::new(self[Self::MAC_DST].try_into().unwrap())
+    // }
 
-    pub fn mac_dst_raw(&self) -> &[u8] {
-        &self[Self::MAC_DST]
-    }
+    // pub fn mac_dst_raw(&self) -> &[u8] {
+    //     &self[Self::MAC_DST]
+    // }
 
-    pub fn mac_dst_ref(&self) -> MacAddrRef<'_> {
-        MacAddrRef::new(&self[Self::MAC_DST])
-    }
+    // pub fn mac_dst_ref(&self) -> MacAddrRef<'_> {
+    //     MacAddrRef::new(&self[Self::MAC_DST])
+    // }
 
-    pub fn set_mac_dst(&mut self, mac: MacAddr) {
-        self[Self::MAC_DST].copy_from_slice(&*mac);
-    }
+    // pub fn set_mac_dst(&mut self, mac: MacAddr) {
+    //     self[Self::MAC_DST].copy_from_slice(&*mac);
+    // }
 
     pub fn mac_dst_mut(&mut self) -> &mut [u8] {
         &mut self[Self::MAC_DST]
@@ -779,13 +847,13 @@ impl<'umem> FrameBuf<'umem> {
     }
 
     /// TODO: could panic on unwrap, consider returing option
-    pub fn mac_src(&self) -> MacAddr {
-        MacAddr::new(self[Self::MAC_SRC].try_into().unwrap())
-    }
+    // pub fn mac_src(&self) -> MacAddr {
+    //     MacAddr::new(self[Self::MAC_SRC].try_into().unwrap())
+    // }
 
-    pub fn mac_src_ref(&self) -> MacAddrRef<'_> {
-        MacAddrRef::new(&self[Self::MAC_SRC])
-    }
+    // pub fn mac_src_ref(&self) -> MacAddrRef<'_> {
+    //     MacAddrRef::new(&self[Self::MAC_SRC])
+    // }
 
     /// Mutable L2 MAC source slice
     pub fn mac_src_mut(&mut self) -> &mut [u8] {
@@ -834,21 +902,21 @@ impl<'umem> FrameBuf<'umem> {
         self[Self::IP_HDR_LEN] |= four_bit_len;
     }
 
-    pub fn ip_version(&self) -> Option<ip::IpVersion> {
-        match (self[Self::IP_VERSION] & 0b11110000) >> 4 {
-            4 => Some(ip::IpVersion::V4),
-            6 => Some(ip::IpVersion::V6),
-            _ => None,
-        }
-    }
+    // pub fn ip_version(&self) -> Option<ip::IpVersion> {
+    //     match (self[Self::IP_VERSION] & 0b11110000) >> 4 {
+    //         4 => Some(ip::IpVersion::V4),
+    //         6 => Some(ip::IpVersion::V6),
+    //         _ => None,
+    //     }
+    // }
 
-    pub fn set_ip_version(&mut self, version: ip::IpVersion) {
-        let ver: u8 = match version {
-            ip::IpVersion::V4 => (4 << 4) & 0b11110000,
-            ip::IpVersion::V6 => (6 << 4) & 0b11110000,
-        };
-        self[Self::IP_VERSION] |= ver;
-    }
+    // pub fn set_ip_version(&mut self, version: ip::IpVersion) {
+    //     let ver: u8 = match version {
+    //         ip::IpVersion::V4 => (4 << 4) & 0b11110000,
+    //         ip::IpVersion::V6 => (6 << 4) & 0b11110000,
+    //     };
+    //     self[Self::IP_VERSION] |= ver;
+    // }
 
     pub fn ip_tos_or_precedence(&self) -> u8 {
         self[Self::IP_TOS_OR_PRECEDENCE].to_le()
@@ -943,17 +1011,17 @@ impl<'umem> FrameBuf<'umem> {
 }
 
 #[derive(Debug)]
-pub(crate) struct UdpPacket<'umem> {
-    frame: FrameBuf<'umem>,
+pub(crate) struct UdpPacket {
+    frame: FrameBuf,
 }
 
-impl UdpPacket<'_> {
+impl UdpPacket {
     const SRC: Range<usize> = 34..36;
     const DST: Range<usize> = 36..38;
     const LEN: Range<usize> = 38..40;
     const CSUM: Range<usize> = 40..42;
 
-    pub(crate) fn new(frame: FrameBuf<'_>) -> UdpPacket<'_> {
+    pub(crate) fn new(frame: FrameBuf) -> UdpPacket {
         assert!(frame.frame_len() >= 42);
         assert_eq!(frame.ip_protocol(), 17);
         UdpPacket { frame }
@@ -1064,12 +1132,12 @@ pub enum EtherType {
 }
 
 #[derive(Debug)]
-pub(crate) struct Inner<'umem> {
+pub(crate) struct Inner {
     data: Buf,
     /// TODO: make an accessor if need be.. don't bother exposing this
     pub(crate) frame: ptr::NonNull<FrameRef>,
     ref_cnt: Cell<usize>,
-    umem: *mut Umem<'umem>,
+    umem: *mut Umem,
 }
 
 #[derive(Debug)]
@@ -1088,7 +1156,7 @@ impl Buf {
     }
 }
 
-impl<'umem> ops::Deref for Buf {
+impl ops::Deref for Buf {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -1096,13 +1164,13 @@ impl<'umem> ops::Deref for Buf {
     }
 }
 
-impl<'umem> ops::DerefMut for Buf {
+impl ops::DerefMut for Buf {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
 
-impl<'umem> ops::Deref for FrameBuf<'umem> {
+impl ops::Deref for FrameBuf {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -1110,7 +1178,7 @@ impl<'umem> ops::Deref for FrameBuf<'umem> {
     }
 }
 
-impl<'umem> ops::DerefMut for FrameBuf<'umem> {
+impl ops::DerefMut for FrameBuf {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut self.ptr.as_mut().data }
     }
@@ -1120,6 +1188,16 @@ impl<'umem> ops::DerefMut for FrameBuf<'umem> {
 mod tests {
     use super::*;
     use std::ptr::NonNull;
+
+    struct DataType();
+
+    #[test]
+    fn shared_mutable_unsafe() {
+        let shared = Shared::new("Some data...".to_owned());
+        // let resp = shared.split("data");
+        // let another = shared.clone();
+        dbg!(&shared);
+    }
 
     #[test]
     fn power_of_two() {
@@ -1147,7 +1225,7 @@ mod tests {
         // for frame in frames {}
         let (outer, ptr) = {
             let mut um = Umem::new(UmemBuilder::new(100)).unwrap();
-            let x = &um as *const Umem<'_>;
+            let x = &um as *const Umem;
             let frames = um.alloc(10);
             assert_eq!(frames.len(), 10);
             let frame = &frames[0];

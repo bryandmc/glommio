@@ -12,8 +12,7 @@ use std::{
     cell::{Cell, RefCell},
     convert::TryFrom,
     ffi::CString,
-    fmt,
-    io,
+    fmt, io,
     mem::{ManuallyDrop, MaybeUninit},
     net::{Shutdown, TcpStream},
     os::unix::{
@@ -24,9 +23,7 @@ use std::{
     rc::Rc,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
-        Mutex,
-        RwLock,
+        Arc, Mutex, RwLock,
     },
     task::Waker,
     time::Duration,
@@ -233,10 +230,19 @@ macro_rules! log_queue_counts {
 }
 
 mod dma_buffer;
+
 #[cfg(feature = "xdp")]
-pub(crate) mod umem;
+pub mod umem;
 #[cfg(feature = "xdp")]
-pub(crate) mod xsk;
+pub mod xsk;
+
+pub use uring::UringCommon;
+
+#[cfg(feature = "xdp")]
+mod xdp {
+    pub use super::uring::UringCommon;
+    pub use super::{umem, xsk};
+}
 
 pub(crate) mod sysfs;
 mod uring;

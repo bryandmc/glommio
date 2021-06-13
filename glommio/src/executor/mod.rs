@@ -32,8 +32,9 @@
 mod multitask;
 
 use std::{
+    borrow::Borrow,
     cell::RefCell,
-    collections::{hash_map::Entry, BinaryHeap},
+    collections::{hash_map::Entry, BinaryHeap, VecDeque},
     future::Future,
     io,
     marker::PhantomData,
@@ -51,17 +52,15 @@ use scoped_tls::scoped_thread_local;
 #[cfg(feature = "xdp")]
 use crate::sys::umem;
 
+#[cfg(feature = "xdp")]
+use crate::sys::xsk;
 use crate::{
-    parking,
-    sys,
+    parking, ref_cnt,
+    sys::{self, umem::MemPool},
     task::{self, waker_fn::waker_fn},
-    GlommioError,
-    IoRequirements,
-    IoStats,
-    Latency,
-    Reactor,
-    Shares,
+    GlommioError, IoRequirements, IoStats, Latency, Reactor, Shares,
 };
+
 // #[cfg(feature = "xdp")]
 // use crate::{net::xdp::XdpConfig, sys::ebpf};
 use ahash::AHashMap;
@@ -348,7 +347,7 @@ impl ExecutorQueues {
         self.preempt_timer_duration = self
             .active_executors
             .iter()
-            .map(|tq| match tq.borrow().io_requirements.latency_req {
+            .map(|tq| match (**tq).borrow().io_requirements.latency_req {
                 Latency::NotImportant => self.default_preempt_timer_duration,
                 Latency::Matters(d) => d,
             })
@@ -418,7 +417,10 @@ pub struct LocalExecutorBuilder {
     preempt_timer_duration: Duration,
 
     #[cfg(feature = "xdp")]
-    umem_config: Option<umem::UmemBuilder>,
+    mempool: Option<umem::UmemBuilder>,
+
+    #[cfg(feature = "xdp")]
+    config: Option<xsk::XskConfig>,
 }
 
 impl LocalExecutorBuilder {
@@ -433,7 +435,10 @@ impl LocalExecutorBuilder {
             preempt_timer_duration: Duration::from_millis(100),
 
             #[cfg(feature = "xdp")]
-            umem_config: None,
+            mempool: None,
+
+            #[cfg(feature = "xdp")]
+            config: None,
         }
     }
 
@@ -472,11 +477,18 @@ impl LocalExecutorBuilder {
     }
 
     /// Xdp configuration.
-    // #[cfg(feature = "xdp")]
-    // pub fn xdp_config(mut self, config: XdpConfig) -> LocalExecutorBuilder {
-    //     self.xdp_config = Some(config);
-    //     self
-    // }
+    #[cfg(feature = "xdp")]
+    pub fn xdp_config(mut self, config: xsk::XskConfig) -> LocalExecutorBuilder {
+        self.config = Some(config);
+        self
+    }
+
+    /// Mempool (Umem) configuration.
+    #[cfg(feature = "xdp")]
+    pub fn mempool(mut self, mempool: umem::UmemBuilder) -> LocalExecutorBuilder {
+        self.mempool = Some(mempool);
+        self
+    }
 
     /// How often [`need_preempt`] will return true by default.
     ///
@@ -507,12 +519,14 @@ impl LocalExecutorBuilder {
         let notifier = sys::new_sleep_notifier()?;
 
         #[cfg(feature = "xdp")]
-        let mut le = LocalExecutor::new(
-            notifier,
-            self.io_memory,
-            self.umem_config,
-            self.preempt_timer_duration,
-        );
+        let mut le = {
+            LocalExecutor::new(
+                notifier,
+                self.io_memory,
+                self.mempool.map(|inner| ref_cnt!(inner.build().unwrap())),
+                self.preempt_timer_duration,
+            )
+        };
 
         #[cfg(not(feature = "xdp"))]
         let mut le = LocalExecutor::new(notifier, self.io_memory, self.preempt_timer_duration);
@@ -588,7 +602,7 @@ impl LocalExecutorBuilder {
                 let mut le = LocalExecutor::new(
                     notifier,
                     self.io_memory,
-                    self.umem_config,
+                    self.mempool.map(|inner| ref_cnt!(inner.build().unwrap())),
                     self.preempt_timer_duration,
                 );
 
@@ -923,6 +937,10 @@ pub struct LocalExecutor {
     parker: parking::Parker,
     id: usize,
     reactor: Rc<parking::Reactor>,
+
+    /// XDP reactor, umem, etc
+    #[cfg(feature = "xdp")]
+    xdp: Rc<xsk::Reactor>,
 }
 
 impl LocalExecutor {
@@ -961,17 +979,21 @@ impl LocalExecutor {
     fn new(
         notifier: Arc<sys::SleepNotifier>,
         io_memory: usize,
-        config: Option<umem::UmemBuilder>,
+        mempool: Option<umem::MemPool>,
         preempt_timer: Duration,
     ) -> LocalExecutor {
         let p = parking::Parker::new();
-        let umem = config.map(|inner| inner.build().unwrap());
         LocalExecutor {
             queues: ExecutorQueues::new(preempt_timer),
             parker: p,
             id: notifier.id(),
-            reactor: Rc::new(parking::Reactor::new(notifier, io_memory, umem)),
+            reactor: Rc::new(parking::Reactor::new(notifier, io_memory)),
+            xdp: Rc::new(xsk::Reactor::new(mempool)),
         }
+    }
+
+    fn get_xdp_reactor(&self) -> Rc<xsk::Reactor> {
+        self.xdp.clone()
     }
 
     /// Returns a unique identifier for this Executor.
@@ -1017,7 +1039,7 @@ impl LocalExecutor {
         let queue_entry = queues.available_executors.entry(handle.index);
         if let Entry::Occupied(entry) = queue_entry {
             let tq = entry.get();
-            if tq.borrow().is_active() {
+            if (**tq).borrow().is_active() {
                 return Err(GlommioError::queue_still_active(handle.index));
             }
 
@@ -1028,7 +1050,7 @@ impl LocalExecutor {
     }
 
     fn get_queue(&self, handle: &TaskQueueHandle) -> Option<Rc<RefCell<TaskQueue>>> {
-        self.queues
+        (*self.queues)
             .borrow()
             .available_executors
             .get(&handle.index)
@@ -1037,12 +1059,7 @@ impl LocalExecutor {
 
     fn current_task_queue(&self) -> TaskQueueHandle {
         TaskQueueHandle {
-            index: self
-                .queues
-                .borrow()
-                .active_executing
-                .as_ref()
-                .unwrap()
+            index: (**(*self.queues).borrow().active_executing.as_ref().unwrap())
                 .borrow()
                 .stats
                 .index,
@@ -1050,14 +1067,13 @@ impl LocalExecutor {
     }
 
     fn mark_me_for_yield(&self) {
-        let queues = self.queues.borrow();
+        let queues = (*self.queues).borrow();
         let mut me = queues.active_executing.as_ref().unwrap().borrow_mut();
         me.yielded = true;
     }
 
     fn spawn<T>(&self, future: impl Future<Output = T>) -> multitask::Task<T> {
-        let tq = self
-            .queues
+        let tq = (*self.queues)
             .borrow()
             .active_executing
             .clone() // this clone is cheap because we clone an `Option<Rc<_>>`
@@ -1065,7 +1081,7 @@ impl LocalExecutor {
             .unwrap();
 
         let id = self.id;
-        let ex = tq.borrow().ex.clone();
+        let ex = (*tq).borrow().ex.clone();
         ex.spawn(id, tq, future)
     }
 
@@ -1076,18 +1092,18 @@ impl LocalExecutor {
         let tq = self
             .get_queue(&handle)
             .ok_or_else(|| GlommioError::queue_not_found(handle.index))?;
-        let ex = tq.borrow().ex.clone();
+        let ex = (*tq).borrow().ex.clone();
         let id = self.id;
 
         Ok(ex.spawn(id, tq, future))
     }
 
     fn preempt_timer_duration(&self) -> Duration {
-        self.queues.borrow().preempt_timer_duration
+        (*self.queues).borrow().preempt_timer_duration
     }
 
     fn spin_before_park(&self) -> Option<Duration> {
-        self.queues.borrow().spin_before_park
+        (*self.queues).borrow().spin_before_park
     }
 
     #[inline(always)]
@@ -1199,50 +1215,57 @@ impl LocalExecutor {
 
         let spin_before_park = self.spin_before_park().unwrap_or_default();
 
-        LOCAL_EX.set(self, || {
-            let future = self.spawn(async move { future.await }).detach();
-            pin!(future);
+        umem::MEMPOOL.set(&self.get_xdp_reactor().mempool().unwrap(), || {
+            LOCAL_EX.set(self, || {
+                let future = self.spawn(async move { future.await }).detach();
+                pin!(future);
 
-            let mut pre_time = Instant::now();
-            loop {
-                if let Poll::Ready(t) = future.as_mut().poll(cx) {
-                    // can't be canceled, and join handle is None only upon
-                    // cancellation or panic. So in case of panic this just propagates
+                let mut pre_time = Instant::now();
+                loop {
+                    if let Poll::Ready(t) = future.as_mut().poll(cx) {
+                        // can't be canceled, and join handle is None only upon
+                        // cancellation or panic. So in case of panic this just propagates
+                        let cur_time = Instant::now();
+                        self.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
+                        break t.unwrap();
+                    }
+
+                    // We want to do I/O before we call run_task_queues,
+                    // for the benefit of the latency ring. If there are pending
+                    // requests that are latency sensitive we want them out of the
+                    // ring ASAP (before we run the task queues). We will also use
+                    // the opportunity to install the timer.
+                    let duration = self.preempt_timer_duration();
+
+                    // Handle IO for XDP socket
+                    #[cfg(feature = "xdp")]
+                    self.xdp.poll_io(duration).unwrap();
+
+                    self.parker.poll_io(duration);
+                    let run = self.run_task_queues();
                     let cur_time = Instant::now();
                     self.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
-                    break t.unwrap();
-                }
-
-                // We want to do I/O before we call run_task_queues,
-                // for the benefit of the latency ring. If there are pending
-                // requests that are latency sensitive we want them out of the
-                // ring ASAP (before we run the task queues). We will also use
-                // the opportunity to install the timer.
-                let duration = self.preempt_timer_duration();
-                self.parker.poll_io(duration);
-                let run = self.run_task_queues();
-                let cur_time = Instant::now();
-                self.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
-                pre_time = cur_time;
-                if !run {
-                    if let Poll::Ready(t) = future.as_mut().poll(cx) {
-                        // It may be that we just became ready now that the task queue
-                        // is exhausted. But if we sleep (park) we'll never know so we
-                        // test again here. We can't test *just* here because the main
-                        // future is probably the one setting up the task queues and etc.
-                        break t.unwrap();
-                    } else {
-                        while !self.reactor.spin_poll_io().unwrap() {
-                            if pre_time.elapsed() > spin_before_park {
-                                self.parker.park();
-                                break;
+                    pre_time = cur_time;
+                    if !run {
+                        if let Poll::Ready(t) = future.as_mut().poll(cx) {
+                            // It may be that we just became ready now that the task queue
+                            // is exhausted. But if we sleep (park) we'll never know so we
+                            // test again here. We can't test *just* here because the main
+                            // future is probably the one setting up the task queues and etc.
+                            break t.unwrap();
+                        } else {
+                            while !self.reactor.spin_poll_io().unwrap() {
+                                if pre_time.elapsed() > spin_before_park {
+                                    self.parker.park();
+                                    break;
+                                }
                             }
+                            // reset the timer for deduct spin loop time
+                            pre_time = Instant::now();
                         }
-                        // reset the timer for deduct spin loop time
-                        pre_time = Instant::now();
                     }
                 }
-            }
+            })
         })
     }
 }
@@ -1427,6 +1450,10 @@ impl<T> Task<T> {
         LOCAL_EX.with(|local_ex| local_ex.get_reactor())
     }
 
+    #[inline]
+    pub(crate) fn get_xdp_reactor() -> Rc<xsk::Reactor> {
+        LOCAL_EX.with(|local_ex| local_ex.get_xdp_reactor())
+    }
     /// Spawns a task onto the current single-threaded executor, in a particular
     /// task queue
     ///
@@ -1612,7 +1639,7 @@ impl<T> Task<T> {
     /// [`Result`]: https://doc.rust-lang.org/std/result/enum.Result.html
     pub fn task_queue_stats(handle: TaskQueueHandle) -> Result<TaskQueueStats> {
         LOCAL_EX.with(|local_ex| match local_ex.get_queue(&handle) {
-            Some(x) => Ok(x.borrow().stats),
+            Some(x) => Ok((*x).borrow().stats),
             None => Err(GlommioError::queue_not_found(handle.index)),
         })
     }
@@ -1647,8 +1674,13 @@ impl<T> Task<T> {
         V: Extend<TaskQueueStats>,
     {
         LOCAL_EX.with(|local_ex| {
-            let tq = local_ex.queues.borrow();
-            output.extend(tq.available_executors.values().map(|x| x.borrow().stats));
+            let tq = (*local_ex.queues).borrow();
+            output.extend(
+                (*tq)
+                    .available_executors
+                    .values()
+                    .map(|x| (**x).borrow().stats),
+            );
             output
         })
     }
@@ -1671,7 +1703,7 @@ impl<T> Task<T> {
     ///
     /// [`ExecutorStats`]: struct.ExecutorStats.html
     pub fn executor_stats() -> ExecutorStats {
-        LOCAL_EX.with(|local_ex| local_ex.queues.borrow().stats)
+        LOCAL_EX.with(|local_ex| (*local_ex.queues).borrow().stats)
     }
 
     /// Returns an [`IoStats`] struct with information about IO performed by
@@ -2034,8 +2066,7 @@ mod test {
     use crate::{
         enclose,
         timer::{self, sleep, Timer},
-        Local,
-        SharesManager,
+        Local, SharesManager,
     };
     use core::mem::MaybeUninit;
     use futures::join;
@@ -2043,8 +2074,7 @@ mod test {
         cell::Cell,
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc,
-            Mutex,
+            Arc, Mutex,
         },
         task::Waker,
     };
@@ -2169,7 +2199,7 @@ mod test {
                             let start = Instant::now();
                             // Now busy loop and make sure that we yield when we have too.
                             loop {
-                                if *(lat_status.borrow()) {
+                                if *((*lat_status).borrow()) {
                                     break; // Success!
                                 }
                                 if start.elapsed().as_secs() > 1 {
@@ -2189,7 +2219,7 @@ mod test {
                         async move {
                             // In case we are executed first, yield to the the other task
                             loop {
-                                if *(nolat_started.borrow()) == false {
+                                if *((*nolat_started).borrow()) == false {
                                     Local::later().await;
                                 } else {
                                     break;
@@ -2260,7 +2290,7 @@ mod test {
                                     break;
                                 }
 
-                                if *(second_status.borrow()) {
+                                if *((*second_status).borrow()) {
                                     panic!("I was preempted but should not have been");
                                 }
                                 Local::yield_if_needed().await;
@@ -2277,7 +2307,7 @@ mod test {
                         async move {
                             // In case we are executed first, yield to the the other task
                             loop {
-                                if *(first_started.borrow()) == false {
+                                if *((*first_started).borrow()) == false {
                                     Local::later().await;
                                 } else {
                                     break;
@@ -2609,10 +2639,10 @@ mod test {
             // have received very low ratio. On the second half we should have
             // accumulated much more. Real numbers are likely much higher than
             // the targets, but those targets are safe.
-            let ratios: Vec<f64> = tq1_count
+            let ratios: Vec<f64> = (*tq1_count)
                 .borrow()
                 .iter()
-                .zip(tq2_count.borrow().iter())
+                .zip((*tq2_count).borrow().iter())
                 .map(|(x, y)| *y as f64 / *x as f64)
                 .collect();
             assert!(ratios[1] > ratios[0]);
